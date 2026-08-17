@@ -34,7 +34,7 @@ Setting up the dataminer:
 
 ```bash
 git clone https://github.com/Telmo26/ievr_dataminer && cd ievr_dataminer
-git checkout 37f224b && git apply ../ievr-extract/dataminer.patch
+git checkout 37f224b && git am < ../ievr-extract/dataminer.patch
 cargo build --profile dist
 ```
 
@@ -105,7 +105,13 @@ exactly that, but it only checks the sections it knows about.
 The invariant that finds a shifted column fastest: **every game id is the CRC32 of its string
 id** (`ps10001` → 975948532, verified on 1716/1716 passives). Dump the table, hash the string ids,
 and the column that matches is the one you want. `dump_schema`, `show_table`, `find_ids` and
-`dbstat` are in the patch for this.
+`dbstat` are in the patch for this, and each module in the patch notes which column it reads and
+what pins it down.
+
+The name placeholder resolver is the one part that fails loudly on purpose: an unknown key stops
+the process with the key and the offending line, rather than writing partial text. The enrichment
+check exists for the same reason — a step reading a raw `.cfg.bin` instead of the resolved
+database is exactly what let `<FUL:KOMEI2>` reach the app once.
 
 Archive names are hashes and may change. `assets\find-texture.ps1` rediscovers them; update
 `$WANTED_ARCHIVES` at the top of `run.ps1`.
