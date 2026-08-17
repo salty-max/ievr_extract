@@ -1,0 +1,3745 @@
+From dd2a5c6b51f5c3fe2ade0c9ec89123ae16456971 Mon Sep 17 00:00:00 2001
+From: salty-max <max@jellycat.fr>
+Date: Mon, 17 Aug 2026 17:06:28 +0200
+Subject: [PATCH] Extract passives, tactics, equipment, teams and resolve name
+ placeholders
+
+Everything needed to feed the Kizuna bundles, on top of upstream main. The
+release binary cannot produce any of this: skill parsing landed after 1.1 was
+cut, and build 6.00.23.00 moved several columns.
+
+Parsing fixes
+- hissatsu: recastTime is column 18 in this build, 19 is a Byte and panicked
+- common: parse_number_value, since T2B stores round numbers as Integer so a
+  numeric column mixes Float and Int between rows
+- text_database: write_skill never wrote description; the request channel now
+  carries (name_id, description_id)
+
+New extraction
+- skills/passive.rs, tactic.rs, equipment.rs: passives moved out of
+  m_skillInfoList into passive_skill_config; tactics and synergies come from
+  item_config; equipment stats sit in the REGULAR_UNIQUE_BASE sub row
+- characters: club affiliation from chara_base column 16
+
+Name placeholders
+- text/name_tags.rs: non-Japanese text ships <FUL:ENDO> style placeholders for
+  the game to fill at runtime. chara_name_tag and map_name_tag resolve them,
+  both keyed by CRC32 of the ASCII key. The prefix picks a chara_text sub
+  entry, measured against Japanese and Simplified Chinese rather than assumed.
+  An unresolved key aborts the process, because main.rs swallows thread panics
+  and a silent fallback is what hid the problem.
+- the text pipeline gained map_text, soccer_game_title and
+  players_universe_text, and writes character_name_parts, place_names and
+  location_names so downstream never re-reads the raw config
+
+Tooling
+- bin/: export_json and merge_db for the bundles, plus dump_schema, show_table,
+  find_ids and dbstat for poking at cfg.bin files, and g4tx_to_png,
+  slice_atlas, png_to_svg for the sprite atlases
+
+Column indices are specific to build 6.00.23.00. A patch will shift them and
+the symptom is a silently empty table, so check the notes in each module.
+---
+ Cargo.lock                     | 111 ++++++++-
+ Cargo.toml                     |   3 +
+ README.md                      |   2 +-
+ src/bin/dbstat.rs              |  50 ++++
+ src/bin/dump_schema.rs         |  23 ++
+ src/bin/export_json.rs         | 374 +++++++++++++++++++++++++++++
+ src/bin/find_ids.rs            |  80 +++++++
+ src/bin/g4tx_to_png.rs         | 122 ++++++++++
+ src/bin/merge_db.rs            | 131 ++++++++++
+ src/bin/patch_character_ids.rs | 124 ++++++++++
+ src/bin/png_to_svg.rs          | 253 ++++++++++++++++++++
+ src/bin/show_table.rs          |  58 +++++
+ src/bin/slice_atlas.rs         | 145 +++++++++++
+ src/characters.rs              | 146 +++++++++--
+ src/characters/character.rs    |   2 +
+ src/common.rs                  |  22 ++
+ src/main.rs                    |   7 +-
+ src/skills.rs                  | 426 ++++++++++++++++++++++++++++++++-
+ src/skills/aura.rs             |   2 +
+ src/skills/equipment.rs        |  49 ++++
+ src/skills/hissatsu.rs         |   4 +-
+ src/skills/passive.rs          |  95 ++++++++
+ src/skills/tactic.rs           |  60 +++++
+ src/text.rs                    |  71 +++++-
+ src/text/name_tags.rs          | 273 +++++++++++++++++++++
+ src/text/text_database.rs      | 288 +++++++++++++++++++++-
+ 26 files changed, 2870 insertions(+), 51 deletions(-)
+ create mode 100644 src/bin/dbstat.rs
+ create mode 100644 src/bin/dump_schema.rs
+ create mode 100644 src/bin/export_json.rs
+ create mode 100644 src/bin/find_ids.rs
+ create mode 100644 src/bin/g4tx_to_png.rs
+ create mode 100644 src/bin/merge_db.rs
+ create mode 100644 src/bin/patch_character_ids.rs
+ create mode 100644 src/bin/png_to_svg.rs
+ create mode 100644 src/bin/show_table.rs
+ create mode 100644 src/bin/slice_atlas.rs
+ create mode 100644 src/skills/equipment.rs
+ create mode 100644 src/skills/passive.rs
+ create mode 100644 src/skills/tactic.rs
+ create mode 100644 src/text/name_tags.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 43eb625..427eab4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2,6 +2,12 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
+ [[package]]
+ name = "aho-corasick"
+ version = "1.1.4"
+@@ -23,6 +29,12 @@ version = "0.22.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+ 
++[[package]]
++name = "bitflags"
++version = "1.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
++
+ [[package]]
+ name = "bitflags"
+ version = "2.10.0"
+@@ -83,6 +95,15 @@ dependencies = [
+  "spin",
+ ]
+ 
++[[package]]
++name = "crc32fast"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
++dependencies = [
++ "cfg-if",
++]
++
+ [[package]]
+ name = "crossbeam"
+ version = "0.8.4"
+@@ -188,7 +209,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+ dependencies = [
+  "libc",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -209,12 +230,31 @@ version = "2.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+ 
++[[package]]
++name = "fdeflate"
++version = "0.3.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
++dependencies = [
++ "simd-adler32",
++]
++
+ [[package]]
+ name = "find-msvc-tools"
+ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+ 
++[[package]]
++name = "flate2"
++version = "1.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
++dependencies = [
++ "crc32fast",
++ "miniz_oxide",
++]
++
+ [[package]]
+ name = "fnv"
+ version = "1.0.7"
+@@ -592,8 +632,10 @@ dependencies = [
+ [[package]]
+ name = "ievr_cfg_bin_editor_core"
+ version = "0.1.0"
++source = "git+https://github.com/Telmo26/ievr_cfg_bin_editor.git?branch=main#20169b9a0f0c70c1ae3390e974e6f9459063816d"
+ dependencies = [
+  "crc-fast",
++ "rustc-hash",
+  "serde",
+  "serde_json",
+ ]
+@@ -605,10 +647,13 @@ dependencies = [
+  "crossbeam",
+  "ievr_cfg_bin_editor_core",
+  "memmap2",
++ "png",
+  "rayon",
+  "regex",
+  "reqwest",
+  "rusqlite",
++ "serde_json",
++ "texture2ddecoder",
+  "toml",
+ ]
+ 
+@@ -704,6 +749,16 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++ "simd-adler32",
++]
++
+ [[package]]
+ name = "mio"
+ version = "1.1.1"
+@@ -744,7 +799,7 @@ version = "0.10.75"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "08838db121398ad17ab8531ce9de97b244589089e290a384c900cb9ff7434328"
+ dependencies = [
+- "bitflags",
++ "bitflags 2.10.0",
+  "cfg-if",
+  "foreign-types",
+  "libc",
+@@ -782,6 +837,12 @@ dependencies = [
+  "vcpkg",
+ ]
+ 
++[[package]]
++name = "paste"
++version = "1.0.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
++
+ [[package]]
+ name = "percent-encoding"
+ version = "2.3.2"
+@@ -806,6 +867,19 @@ version = "0.3.32"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+ 
++[[package]]
++name = "png"
++version = "0.17.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
++dependencies = [
++ "bitflags 1.3.2",
++ "crc32fast",
++ "fdeflate",
++ "flate2",
++ "miniz_oxide",
++]
++
+ [[package]]
+ name = "potential_utf"
+ version = "0.1.4"
+@@ -955,7 +1029,7 @@ version = "0.38.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f1c93dd1c9683b438c392c492109cb702b8090b2bfc8fed6f6e4eb4523f17af3"
+ dependencies = [
+- "bitflags",
++ "bitflags 2.10.0",
+  "fallible-iterator",
+  "fallible-streaming-iterator",
+  "hashlink",
+@@ -964,17 +1038,23 @@ dependencies = [
+  "sqlite-wasm-rs",
+ ]
+ 
++[[package]]
++name = "rustc-hash"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
++
+ [[package]]
+ name = "rustix"
+ version = "1.1.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "146c9e247ccc180c1f61615433868c99f3de3ae256a30a43b49f67c2d9171f34"
+ dependencies = [
+- "bitflags",
++ "bitflags 2.10.0",
+  "errno",
+  "libc",
+  "linux-raw-sys",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -1031,7 +1111,7 @@ version = "2.11.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+ dependencies = [
+- "bitflags",
++ "bitflags 2.10.0",
+  "core-foundation",
+  "core-foundation-sys",
+  "libc",
+@@ -1106,6 +1186,12 @@ version = "1.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+ 
++[[package]]
++name = "simd-adler32"
++version = "0.3.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
++
+ [[package]]
+ name = "slab"
+ version = "0.4.12"
+@@ -1199,7 +1285,16 @@ dependencies = [
+  "getrandom 0.3.4",
+  "once_cell",
+  "rustix",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "texture2ddecoder"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "427ae8ec7f2f0fdd3146b77cfa44bea880caf066f7e55398a8467afe2645c832"
++dependencies = [
++ "paste",
+ ]
+ 
+ [[package]]
+@@ -1339,7 +1434,7 @@ version = "0.6.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
+ dependencies = [
+- "bitflags",
++ "bitflags 2.10.0",
+  "bytes",
+  "futures-util",
+  "http",
+diff --git a/Cargo.toml b/Cargo.toml
+index b9b2b01..f37fb3f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,4 +19,7 @@ regex = { version = "1.12.2", default-features = false, features = ["std", "perf
+ rusqlite = {version = "0.38.0", features = ["bundled"]}
+ ievr_cfg_bin_editor_core = { git = "https://github.com/Telmo26/ievr_cfg_bin_editor.git", branch = "main" }
+ toml = "0.9"
++serde_json = "1"
++texture2ddecoder = "0.1"
++png = "0.17"
+ reqwest = { version = "0.13", default-features = false, features = ["blocking", "http2", "native-tls"] }
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index 4e803fc..6cb7e40 100644
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,7 @@ Relies on [IEVR Toolbox](https://github.com/Telmo26/ievr_toolbox) for extracting
+ 
+ # Features
+ 
+-- **Character data**: This tool automatically extracts element, main position, alternative position, archetype, and stats for every character. See roadmap section for future data to be extracted.
++- **Character data**: This tool automatically extracts the game string id (`character_id`, e.g. `c01000010` — the key Inazugle uses for 3D models), element, main position, alternative position, archetype, and stats for every character. See roadmap section for future data to be extracted.
+ - **Translation data**: This tool is language agnostic. The character data extracted is only comprised of numbers, and every language file is extracted in its own database, so that everyone can use this tool, regardless of what language they actually want to display the extracted data in.
+ 
+ # Requirements
+diff --git a/src/bin/dbstat.rs b/src/bin/dbstat.rs
+new file mode 100644
+index 0000000..d1ca9a0
+--- /dev/null
++++ b/src/bin/dbstat.rs
+@@ -0,0 +1,50 @@
++use std::env;
++
++use rusqlite::Connection;
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 2 {
++        eprintln!("usage: dbstat <db.sqlite> [sql]");
++        std::process::exit(1);
++    }
++
++    let conn = Connection::open(&args[1]).expect("open failed");
++
++    if let Some(sql) = args.get(2) {
++        let mut stmt = conn.prepare(sql).expect("bad sql");
++        let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
++        println!("{}", cols.join(" | "));
++        let n = cols.len();
++        let mut rows = stmt.query([]).unwrap();
++        while let Some(row) = rows.next().unwrap() {
++            let vals: Vec<String> = (0..n)
++                .map(|i| match row.get_ref(i).unwrap() {
++                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
++                    rusqlite::types::ValueRef::Integer(v) => v.to_string(),
++                    rusqlite::types::ValueRef::Real(v) => format!("{v}"),
++                    rusqlite::types::ValueRef::Text(v) => String::from_utf8_lossy(v).to_string(),
++                    rusqlite::types::ValueRef::Blob(v) => format!("<{} bytes>", v.len()),
++                })
++                .collect();
++            println!("{}", vals.join(" | "));
++        }
++        return;
++    }
++
++    let mut stmt = conn
++        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
++        .unwrap();
++    let names: Vec<String> = stmt
++        .query_map([], |r| r.get::<_, String>(0))
++        .unwrap()
++        .map(|r| r.unwrap())
++        .collect();
++
++    for name in names {
++        let count: i64 = conn
++            .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| r.get(0))
++            .unwrap_or(-1);
++        println!("  {name:<26} {count} rows");
++    }
++}
+diff --git a/src/bin/dump_schema.rs b/src/bin/dump_schema.rs
+new file mode 100644
+index 0000000..5b83510
+--- /dev/null
++++ b/src/bin/dump_schema.rs
+@@ -0,0 +1,23 @@
++use std::env;
++use std::fs;
++
++use ievr_cfg_bin_editor_core::parse_database;
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: dump_schema <file.cfg.bin> <out.json>");
++        std::process::exit(1);
++    }
++
++    let bytes = fs::read(&args[1]).expect("could not read file");
++    let db = parse_database(&bytes).expect("could not parse database");
++
++    for t in db.tables() {
++        eprintln!("  {}  ({} rows)", t.name(), t.rows().len());
++    }
++
++    let json = db.serialize().expect("serialize failed");
++    fs::write(&args[2], json).expect("write failed");
++    eprintln!("written to {}", args[2]);
++}
+diff --git a/src/bin/export_json.rs b/src/bin/export_json.rs
+new file mode 100644
+index 0000000..81a9b4f
+--- /dev/null
++++ b/src/bin/export_json.rs
+@@ -0,0 +1,374 @@
++﻿use std::env;
++use std::fs;
++use std::path::Path;
++
++use rusqlite::{Connection, Row};
++use serde_json::{Map, Value, json};
++
++const LANGUAGES: [&str; 3] = ["en", "fr", "ja"];
++
++/// Emblem fields hold the CRC32 of the texture's file name, so the shipped
++/// files have to be hashed to be matched back.
++fn crc32(name: &str) -> i32 {
++    let mut table = [0u32; 256];
++    for (i, entry) in table.iter_mut().enumerate() {
++        let mut c = i as u32;
++        for _ in 0..8 {
++            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
++        }
++        *entry = c;
++    }
++
++    let mut crc = 0xFFFF_FFFFu32;
++    for b in name.as_bytes() {
++        crc = (crc >> 8) ^ table[((crc ^ *b as u32) & 0xFF) as usize];
++    }
++    (!crc) as i32
++}
++
++fn emblem_index(dir: Option<&String>) -> std::collections::HashMap<i32, String> {
++    let mut map = std::collections::HashMap::new();
++    let Some(dir) = dir else { return map };
++    let Ok(entries) = fs::read_dir(dir) else { return map };
++
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.extension().is_some_and(|e| e == "png") {
++            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
++            map.insert(crc32(&stem), stem);
++        }
++    }
++    map
++}
++
++/// Japanese text marks readings as [kanji/kana]; this keeps only the kanji.
++fn strip_furigana(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut rest = text;
++
++    while let Some(start) = rest.find('[') {
++        let Some(close) = rest[start..].find(']') else { break };
++        let inner = &rest[start + 1..start + close];
++
++        let Some(slash) = inner.find('/') else {
++            out.push_str(&rest[..start + close + 1]);
++            rest = &rest[start + close + 1..];
++            continue;
++        };
++
++        out.push_str(&rest[..start]);
++        out.push_str(&inner[..slash]);
++        rest = &rest[start + close + 1..];
++    }
++
++    out.push_str(rest);
++    out
++}
++
++/// Emits `field`, plus `field_plain` when the string carries furigana markup.
++fn text_fields(target: &mut Map<String, Value>, field: &str, text: Option<String>) {
++    let Some(text) = text else {
++        target.insert(field.to_string(), Value::Null);
++        return;
++    };
++
++    let plain = strip_furigana(&text);
++    if plain != text {
++        target.insert(format!("{field}_plain"), json!(plain));
++    }
++    target.insert(field.to_string(), json!(text));
++}
++
++fn stat_block(row: &Row, prefix: &str) -> Value {
++    let get = |name: &str| -> Value {
++        row.get::<_, Option<i64>>(format!("{prefix}_{name}").as_str())
++            .ok()
++            .flatten()
++            .map(|v| json!(v))
++            .unwrap_or(Value::Null)
++    };
++
++    json!({
++        "kick": get("kick"),
++        "control": get("control"),
++        "technique": get("technique"),
++        "pressure": get("pressure"),
++        "physical": get("physical"),
++        "agility": get("agility"),
++        "intelligence": get("intelligence"),
++    })
++}
++
++fn characters(
++    conn: &Connection,
++    lang: &str,
++    table: &str,
++    emblems: &std::collections::HashMap<i32, String>,
++) -> rusqlite::Result<Vec<Value>> {
++    let sql = format!(
++        "SELECT c.*, n.name AS loc_name, r.name AS orig_name, d.description AS descr,
++                s.name AS series, tn.name AS team, ct.team_id AS team_id,
++                t.emblem_v AS em_v, t.emblem_ie AS em_ie, t.emblem_go AS em_go,
++                t.emblem_areori AS em_ar
++         FROM {table} c
++         LEFT JOIN character_names      n ON n.id = c.name_id        AND n.lang = ?1
++         LEFT JOIN character_names_roma r ON r.id = c.name_id        AND r.lang = ?1
++         LEFT JOIN character_descriptions d ON d.id = c.description_id AND d.lang = ?1
++         LEFT JOIN series_names         s ON s.id = c.series_id      AND s.lang = ?1
++         LEFT JOIN character_teams     ct ON ct.index_id = c.index_id
++         LEFT JOIN teams                t ON t.team_id = ct.team_id
++         LEFT JOIN team_names          tn ON tn.id = t.name_id       AND tn.lang = ?1"
++    );
++
++    let mut stmt = conn.prepare(&sql)?;
++    let rows = stmt.query_map([lang], |row| {
++        let mut object = Map::new();
++        object.insert("id".into(), json!(row.get::<_, i64>("index_id")?));
++        // Game string id (`c01000010`) — Inazugle's 3D-model / viewer key.
++        if let Ok(character_id) = row.get::<_, String>("character_id") {
++            if !character_id.is_empty() {
++                object.insert("character_id".into(), json!(character_id));
++            }
++        }
++
++        // The game lets you show original Japanese player names in any language
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("loc_name")?);
++        text_fields(&mut object, "name_original", row.get::<_, Option<String>>("orig_name")?);
++        text_fields(&mut object, "description", row.get::<_, Option<String>>("descr")?);
++        text_fields(&mut object, "series", row.get::<_, Option<String>>("series")?);
++        text_fields(&mut object, "team", row.get::<_, Option<String>>("team")?);
++        object.insert("team_id".into(), json!(row.get::<_, Option<i64>>("team_id")?));
++
++        // Victory Road's own emblem first, then the earlier eras: only a third
++        // of the clubs ship a V one, so V alone would leave most players blank.
++        // `emblem_era` says which one was actually picked.
++        let lookup = |column: &str| -> Option<String> {
++            row.get::<_, Option<i64>>(column)
++                .ok()
++                .flatten()
++                .and_then(|v| emblems.get(&(v as i32)).cloned())
++        };
++
++        let (emblem, era) = [("v", "em_v"), ("ie", "em_ie"), ("go", "em_go"), ("areori", "em_ar")]
++            .iter()
++            .find_map(|(era, column)| lookup(column).map(|file| (file, *era)))
++            .map_or((None, None), |(file, era)| (Some(file), Some(era)));
++
++        object.insert("emblem".into(), json!(emblem));
++        object.insert("emblem_era".into(), json!(era));
++
++        for field in ["element", "main_position", "alt_position", "style"] {
++            object.insert(field.into(), json!(row.get::<_, Option<i64>>(field)?));
++        }
++
++        object.insert("stats_lv50".into(), stat_block(row, "lvl50"));
++        object.insert("stats_lv99".into(), stat_block(row, "lvl99"));
++
++        Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn skills(conn: &Connection, lang: &str, table: &str) -> rusqlite::Result<Vec<Value>> {
++    let sql = format!(
++        "SELECT k.*, s.name AS sname, s.description AS sdesc
++         FROM {table} k
++         LEFT JOIN skill_names s ON s.id = k.name_id AND s.lang = ?1"
++    );
++
++    let mut stmt = conn.prepare(&sql)?;
++    let rows = stmt.query_map([lang], |row| {
++        let mut object = Map::new();
++        object.insert("id".into(), json!(row.get::<_, i64>("skill_id")?));
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("sname")?);
++        text_fields(&mut object, "description", row.get::<_, Option<String>>("sdesc")?);
++
++        for field in [
++            "power", "element", "category", "growth_rate", "tp_consumption", "cooldown",
++        ] {
++            object.insert(field.into(), json!(row.get::<_, Option<i64>>(field)?));
++        }
++        for field in ["is_block", "is_longshot"] {
++            object.insert(field.into(), json!(row.get::<_, Option<bool>>(field)?));
++        }
++
++        Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn auras(conn: &Connection, lang: &str) -> rusqlite::Result<Vec<Value>> {
++    let mut stmt = conn.prepare(
++        "SELECT a.*, s.name AS sname, s.description AS sdesc
++         FROM aura a
++         LEFT JOIN skill_names s ON s.id = a.name_id AND s.lang = ?1",
++    )?;
++
++    let rows = stmt.query_map([lang], |row| {
++        let mut object = Map::new();
++        object.insert("id".into(), json!(row.get::<_, i64>("aura_id")?));
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("sname")?);
++        text_fields(&mut object, "description", row.get::<_, Option<String>>("sdesc")?);
++        object.insert("skill_id".into(), json!(row.get::<_, Option<i64>>("skill_id")?));
++        object.insert("element".into(), json!(row.get::<_, Option<i64>>("element")?));
++        Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn passives(conn: &Connection, lang: &str) -> rusqlite::Result<Vec<Value>> {
++    // A passive can belong to several rarity families, so the tiers are
++    // collected first and attached as a list to keep one entry per passive.
++    let mut tiers: std::collections::HashMap<i64, Vec<Value>> = std::collections::HashMap::new();
++    {
++        let mut stmt =
++            conn.prepare("SELECT passive_id, family_index, tier FROM passive_rarity_tiers")?;
++        let mut rows = stmt.query([])?;
++        while let Some(row) = rows.next()? {
++            tiers
++                .entry(row.get("passive_id")?)
++                .or_default()
++                .push(json!({ "family": row.get::<_, i64>("family_index")?, "tier": row.get::<_, i64>("tier")? }));
++        }
++    }
++
++    let mut stmt = conn.prepare(
++        "SELECT p.*, s.name AS sname
++         FROM passive_skills p
++         LEFT JOIN skill_names s ON s.id = p.name_id AND s.lang = ?1",
++    )?;
++
++    let rows = stmt.query_map([lang], |row| {
++        let id: i64 = row.get("passive_id")?;
++
++        let mut object = Map::new();
++        object.insert("id".into(), json!(id));
++        object.insert("string_id".into(), json!(row.get::<_, String>("string_id")?));
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("sname")?);
++        object.insert("value".into(), json!(row.get::<_, Option<f64>>("value")?));
++        object.insert("category".into(), json!(row.get::<_, i64>("category")?));
++        object.insert("buff_icon".into(), json!(row.get::<_, Option<i64>>("buff_icon")?));
++        object.insert("tiers".into(), json!(tiers.get(&id).cloned().unwrap_or_default()));
++        Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn tactics(conn: &Connection, lang: &str) -> rusqlite::Result<Vec<Value>> {
++    let mut stmt = conn.prepare(
++        "SELECT t.*, n.name AS tname, d.description AS tdesc
++         FROM tactics t
++         LEFT JOIN item_names        n ON n.id = t.name_id        AND n.lang = ?1
++         LEFT JOIN item_descriptions d ON d.id = t.description_id AND d.lang = ?1",
++    )?;
++
++    let rows = stmt.query_map([lang], |row| {
++        let mut object = Map::new();
++        object.insert("id".into(), json!(row.get::<_, i64>("tactic_id")?));
++        object.insert("string_id".into(), json!(row.get::<_, String>("string_id")?));
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("tname")?);
++        text_fields(&mut object, "description", row.get::<_, Option<String>>("tdesc")?);
++        object.insert("tp_cost".into(), json!(row.get::<_, f64>("tp_cost")?));
++                Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn synergies(conn: &Connection, lang: &str) -> rusqlite::Result<Vec<Value>> {
++    let mut stmt = conn.prepare(
++        "SELECT s.*, n.name AS sname, d.description AS sdesc
++         FROM synergies s
++         LEFT JOIN item_names        n ON n.id = s.name_id        AND n.lang = ?1
++         LEFT JOIN item_descriptions d ON d.id = s.description_id AND d.lang = ?1",
++    )?;
++
++    let rows = stmt.query_map([lang], |row| {
++        let mut object = Map::new();
++        object.insert("id".into(), json!(row.get::<_, i64>("synergy_id")?));
++        object.insert("string_id".into(), json!(row.get::<_, String>("string_id")?));
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("sname")?);
++        text_fields(&mut object, "description", row.get::<_, Option<String>>("sdesc")?);
++                Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn equipment(conn: &Connection, lang: &str) -> rusqlite::Result<Vec<Value>> {
++    let mut stmt = conn.prepare(
++        "SELECT e.*, n.name AS ename, d.description AS edesc
++         FROM equipment e
++         LEFT JOIN item_names        n ON n.id = e.name_id        AND n.lang = ?1
++         LEFT JOIN item_descriptions d ON d.id = e.description_id AND d.lang = ?1",
++    )?;
++
++    let rows = stmt.query_map([lang], |row| {
++        let mut object = Map::new();
++        object.insert("id".into(), json!(row.get::<_, i64>("item_id")?));
++        object.insert("slot".into(), json!(row.get::<_, String>("slot")?));
++        object.insert("string_id".into(), json!(row.get::<_, String>("string_id")?));
++        text_fields(&mut object, "name", row.get::<_, Option<String>>("ename")?);
++        text_fields(&mut object, "description", row.get::<_, Option<String>>("edesc")?);
++
++        let mut stats = Map::new();
++        for stat in ["kick", "control", "technique", "pressure", "physical", "agility", "intelligence"] {
++            stats.insert(stat.into(), json!(row.get::<_, i64>(stat)?));
++        }
++        object.insert("stats".into(), Value::Object(stats));
++
++        Ok(Value::Object(object))
++    })?;
++
++    rows.collect()
++}
++
++fn main() -> rusqlite::Result<()> {
++    let args: Vec<String> = env::args().collect();
++    let out_dir = args.get(1).map(String::as_str).unwrap_or("output");
++
++    let emblems = emblem_index(args.get(2));
++    println!("emblemes indexes : {}", emblems.len());
++
++    let conn = Connection::open(Path::new(out_dir).join("ievr.sqlite"))?;
++    let json_dir = Path::new(out_dir).join("json");
++    fs::create_dir_all(&json_dir).unwrap();
++
++    for lang in LANGUAGES {
++        let bundle = json!({
++            "lang": lang,
++            "game_version": "6.00.23.00",
++            "legend": {
++                "element": { "1": "wind", "2": "forest", "3": "fire", "4": "mountain", "5": "unknown" },
++                "note": "main_position, alt_position, style and category are raw game codes"
++            },
++            "characters": characters(&conn, lang, "characters", &emblems)?,
++            "heroes": characters(&conn, lang, "heroes", &emblems)?,
++            "basaras": characters(&conn, lang, "basaras", &emblems)?,
++            "hissatsu": skills(&conn, lang, "hissatsu")?,
++            "aura_hissatsu": skills(&conn, lang, "aura_hissatsu")?,
++            "auras": auras(&conn, lang)?,
++            "passives": passives(&conn, lang)?,
++            "tactics": tactics(&conn, lang)?,
++            "synergies": synergies(&conn, lang)?,
++            "equipment": equipment(&conn, lang)?,
++        });
++
++        let path = json_dir.join(format!("ievr.{lang}.json"));
++        fs::write(&path, serde_json::to_string(&bundle).unwrap()).unwrap();
++
++        let size = fs::metadata(&path).unwrap().len();
++        println!("  {:<22} {:>7.2} MB", path.display().to_string(), size as f64 / 1e6);
++    }
++
++    Ok(())
++}
++
++
++
++
++
+diff --git a/src/bin/find_ids.rs b/src/bin/find_ids.rs
+new file mode 100644
+index 0000000..5a8b17f
+--- /dev/null
++++ b/src/bin/find_ids.rs
+@@ -0,0 +1,80 @@
++use std::collections::HashSet;
++use std::env;
++use std::fs;
++use std::path::{Path, PathBuf};
++
++use ievr_cfg_bin_editor_core::{Value, parse_database};
++
++fn as_id(v: &Value) -> Option<i32> {
++    match v {
++        Value::Int(x) => Some(*x),
++        Value::UInt(x) => Some(x.cast_signed()),
++        Value::Hash(x) => Some(x.cast_signed()),
++        _ => None,
++    }
++}
++
++fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
++    let Ok(entries) = fs::read_dir(dir) else { return };
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.is_dir() {
++            walk(&path, out);
++        } else if path.to_string_lossy().ends_with(".cfg.bin") {
++            out.push(path);
++        }
++    }
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: find_ids <ids.txt> <root_dir>");
++        std::process::exit(1);
++    }
++
++    let targets: HashSet<i32> = fs::read_to_string(&args[1])
++        .expect("could not read ids")
++        .lines()
++        .filter_map(|l| l.trim().parse::<i32>().ok())
++        .collect();
++
++    println!("looking for {} ids", targets.len());
++
++    let mut files = Vec::new();
++    walk(Path::new(&args[2]), &mut files);
++    println!("scanning {} cfg.bin files\n", files.len());
++
++    for file in files {
++        let Ok(bytes) = fs::read(&file) else { continue };
++
++        // parse_database panics on unknown formats, so isolate it
++        let parsed = std::panic::catch_unwind(|| parse_database(&bytes));
++        let Ok(Ok(db)) = parsed else { continue };
++
++        for table in db.tables() {
++            let mut found = HashSet::new();
++            for row in table.rows() {
++                for col in &row.values {
++                    for value in col {
++                        if let Some(id) = as_id(value) {
++                            if targets.contains(&id) {
++                                found.insert(id);
++                            }
++                        }
++                    }
++                }
++            }
++
++            if !found.is_empty() {
++                println!(
++                    "{:>5} / {}  {}  ->  {}",
++                    found.len(),
++                    targets.len(),
++                    file.display(),
++                    table.name()
++                );
++            }
++        }
++    }
++}
+diff --git a/src/bin/g4tx_to_png.rs b/src/bin/g4tx_to_png.rs
+new file mode 100644
+index 0000000..13b9ebd
+--- /dev/null
++++ b/src/bin/g4tx_to_png.rs
+@@ -0,0 +1,122 @@
++//! Converts Level-5 `.g4tx` textures to PNG.
++//!
++//! A `.g4tx` is a thin wrapper: a `G4TX` header of variable length followed by a
++//! standard DDS. The DDS offset is not fixed, so the magic is searched for
++//! rather than assumed. Textures in this game are BC7, which needs a real block
++//! decoder — `image`'s DDS support only covers BC1/2/3.
++
++use std::env;
++use std::fs::{self, File};
++use std::io::BufWriter;
++use std::path::{Path, PathBuf};
++
++fn u32_at(data: &[u8], offset: usize) -> u32 {
++    u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
++}
++
++fn find_dds(data: &[u8]) -> Option<usize> {
++    data.windows(4).position(|w| w == b"DDS ")
++}
++
++fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
++    let Ok(entries) = fs::read_dir(dir) else { return };
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.is_dir() {
++            walk(&path, out);
++        } else if path.extension().is_some_and(|e| e == "g4tx") {
++            out.push(path);
++        }
++    }
++}
++
++/// texture2ddecoder yields 0xAARRGGBB words; PNG wants straight RGBA bytes.
++fn argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(pixels.len() * 4);
++    for p in pixels {
++        out.push((p >> 16) as u8);
++        out.push((p >> 8) as u8);
++        out.push(*p as u8);
++        out.push((p >> 24) as u8);
++    }
++    out
++}
++
++fn convert(path: &Path, out_root: &Path, in_root: &Path) -> Result<(usize, usize), String> {
++    let data = fs::read(path).map_err(|e| e.to_string())?;
++    let dds = find_dds(&data).ok_or("no DDS payload")?;
++
++    let height = u32_at(&data, dds + 12) as usize;
++    let width = u32_at(&data, dds + 16) as usize;
++    let four_cc = &data[dds + 84..dds + 88];
++
++    let (format, pixels_at) = if four_cc == b"DX10" {
++        (u32_at(&data, dds + 128), dds + 148)
++    } else {
++        let tag = String::from_utf8_lossy(four_cc).to_string();
++        return Err(format!("unhandled FourCC {tag}"));
++    };
++
++    let payload = &data[pixels_at..];
++    let mut buffer = vec![0u32; width * height];
++
++    match format {
++        98 | 99 => texture2ddecoder::decode_bc7(payload, width, height, &mut buffer)
++            .map_err(|e| format!("bc7: {e}"))?,
++        77 | 78 => texture2ddecoder::decode_bc3(payload, width, height, &mut buffer)
++            .map_err(|e| format!("bc3: {e}"))?,
++        71 | 72 => texture2ddecoder::decode_bc1(payload, width, height, &mut buffer)
++            .map_err(|e| format!("bc1: {e}"))?,
++        other => return Err(format!("unhandled DXGI format {other}")),
++    }
++
++    let relative = path.strip_prefix(in_root).unwrap_or(path);
++    let target = out_root.join(relative).with_extension("png");
++    fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
++
++    let file = File::create(&target).map_err(|e| e.to_string())?;
++    let mut encoder = png::Encoder::new(BufWriter::new(file), width as u32, height as u32);
++    encoder.set_color(png::ColorType::Rgba);
++    encoder.set_depth(png::BitDepth::Eight);
++
++    encoder
++        .write_header()
++        .map_err(|e| e.to_string())?
++        .write_image_data(&argb_to_rgba(&buffer))
++        .map_err(|e| e.to_string())?;
++
++    Ok((width, height))
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: g4tx_to_png <input_dir> <output_dir>");
++        std::process::exit(1);
++    }
++
++    let in_root = Path::new(&args[1]);
++    let out_root = Path::new(&args[2]);
++
++    let mut files = Vec::new();
++    walk(in_root, &mut files);
++    files.sort();
++
++    let mut ok = 0;
++    let mut failed = 0;
++
++    for file in &files {
++        match convert(file, out_root, in_root) {
++            Ok((w, h)) => {
++                ok += 1;
++                println!("  {:>5}x{:<5} {}", w, h, file.strip_prefix(in_root).unwrap_or(file).display());
++            }
++            Err(e) => {
++                failed += 1;
++                eprintln!("  FAILED {} : {e}", file.display());
++            }
++        }
++    }
++
++    println!("\n{ok} converted, {failed} failed");
++}
+diff --git a/src/bin/merge_db.rs b/src/bin/merge_db.rs
+new file mode 100644
+index 0000000..84f03ef
+--- /dev/null
++++ b/src/bin/merge_db.rs
+@@ -0,0 +1,131 @@
++﻿use std::env;
++use std::fs;
++use std::path::Path;
++
++use rusqlite::Connection;
++
++const LANGUAGES: [&str; 9] = ["de", "en", "es", "fr", "it", "ja", "pt", "zh_hans", "zh_hant"];
++
++/// Text tables are per language upstream; here they get a `lang` column.
++const TEXT_TABLES: [(&str, &str); 11] = [
++    ("character_names", "id, name"),
++    ("character_names_roma", "id, name"),
++    ("character_descriptions", "id, description"),
++    ("character_name_parts", "id, part, text"),
++    ("skill_names", "id, name, description"),
++    ("series_names", "id, name"),
++    ("team_names", "id, name"),
++    ("item_names", "id, name"),
++    ("item_descriptions", "id, description"),
++    ("place_names", "id, name"),
++    ("location_names", "id, name"),
++];
++
++fn main() -> rusqlite::Result<()> {
++    let args: Vec<String> = env::args().collect();
++    let out_dir = args.get(1).map(String::as_str).unwrap_or("output");
++    let target = Path::new(out_dir).join("ievr.sqlite");
++
++    let _ = fs::remove_file(&target);
++    let conn = Connection::open(&target)?;
++
++    conn.pragma_update(None, "journal_mode", "OFF")?;
++    conn.pragma_update(None, "synchronous", "OFF")?;
++
++    // Character and skill tables copy over unchanged
++    for (file, tables) in [
++        (
++            "characters.sqlite",
++            vec!["characters", "heroes", "basaras", "teams", "character_teams"],
++        ),
++        (
++            "skills.sqlite",
++            vec![
++                "hissatsu",
++                "aura_hissatsu",
++                "aura",
++                "passives",
++                "passive_skills",
++                "passive_rarity_tiers",
++                "passive_skill_effects",
++                "tactics",
++                "synergies",
++                "equipment",
++            ],
++        ),
++    ] {
++        let path = Path::new(out_dir).join(file);
++        conn.execute("ATTACH DATABASE ?1 AS src", [path.to_string_lossy()])?;
++
++        for table in tables {
++            conn.execute_batch(&format!(
++                "CREATE TABLE {table} AS SELECT * FROM src.{table};"
++            ))?;
++            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
++            println!("  {table:<24} {n} rows");
++        }
++
++        conn.execute_batch("DETACH DATABASE src;")?;
++    }
++
++    // Text tables get folded together, one row per language
++    conn.execute_batch(
++        "CREATE TABLE character_names        (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE character_names_roma   (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE character_descriptions (lang TEXT NOT NULL, id INTEGER NOT NULL, description TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE skill_names            (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, description TEXT, PRIMARY KEY (lang, id));
++         CREATE TABLE series_names           (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE team_names             (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE item_names             (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE item_descriptions      (lang TEXT NOT NULL, id INTEGER NOT NULL, description TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE character_name_parts   (lang TEXT NOT NULL, id INTEGER NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY (lang, id, part));
++         CREATE TABLE place_names            (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));
++         CREATE TABLE location_names         (lang TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (lang, id));",
++    )?;
++
++    for language in LANGUAGES {
++        let path = Path::new(out_dir).join("text").join(format!("{language}.sqlite"));
++        conn.execute("ATTACH DATABASE ?1 AS t", [path.to_string_lossy()])?;
++
++        for (table, columns) in TEXT_TABLES {
++            conn.execute_batch(&format!(
++                "INSERT INTO {table} (lang, {columns})
++                 SELECT '{language}', {columns} FROM t.{table};"
++            ))?;
++        }
++
++        conn.execute_batch("DETACH DATABASE t;")?;
++    }
++
++    for (table, _) in TEXT_TABLES {
++        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
++        println!("  {table:<24} {n} rows (all languages)");
++    }
++
++    // Indexes for the lookups an app actually does
++    conn.execute_batch(
++        "CREATE INDEX idx_hissatsu_name        ON hissatsu(name_id);
++         CREATE INDEX idx_aura_hissatsu_name   ON aura_hissatsu(name_id);
++         CREATE INDEX idx_aura_name            ON aura(name_id);
++         CREATE INDEX idx_passive_name         ON passive_skills(name_id);
++         CREATE INDEX idx_passive_string       ON passive_skills(string_id);
++         CREATE INDEX idx_tiers_passive        ON passive_rarity_tiers(passive_id);
++         CREATE INDEX idx_effects_effect       ON passive_skill_effects(effect_id);
++         CREATE INDEX idx_chara_name           ON characters(name_id);
++         CREATE INDEX idx_chara_character_id   ON characters(character_id);
++         CREATE INDEX idx_chara_series         ON characters(series_id);
++         CREATE INDEX idx_chara_team           ON character_teams(team_id);
++         CREATE INDEX idx_chara_element        ON characters(element);
++         CREATE INDEX idx_chara_position       ON characters(main_position);
++         CREATE INDEX idx_text_skill_id        ON skill_names(id);
++         CREATE INDEX idx_text_chara_id        ON character_names(id);",
++    )?;
++
++    conn.execute_batch("ANALYZE; VACUUM;")?;
++
++    println!("\nwritten to {}", target.display());
++    Ok(())
++}
++
++
++
+diff --git a/src/bin/patch_character_ids.rs b/src/bin/patch_character_ids.rs
+new file mode 100644
+index 0000000..44d34a3
+--- /dev/null
++++ b/src/bin/patch_character_ids.rs
+@@ -0,0 +1,124 @@
++//! Stamp `character_id` (the game string id, e.g. `c01000010`) onto an already
++//! exported `ievr.{lang}.json` bundle without rebuilding the rest of the dump.
++//!
++//! Inazugle's 3D viewer keys models on this id:
++//!   `{"character_id":["c01000010"]}` XOR 0xFF, base64url → `?q=…`
++//!
++//! usage: patch_character_ids <chara_base.cfg.bin> <json_dir>
++
++use std::collections::HashMap;
++use std::env;
++use std::fs;
++use std::path::Path;
++
++use ievr_cfg_bin_editor_core::{Value, parse_database};
++use serde_json::Value as Json;
++
++fn parse_int(value: &Value) -> Option<i32> {
++    match value {
++        Value::Int(v) => Some(*v),
++        Value::UInt(v) => Some(v.cast_signed()),
++        Value::Hash(v) => Some(v.cast_signed()),
++        _ => None,
++    }
++}
++
++fn parse_string(value: &Value) -> Option<String> {
++    match value {
++        Value::String(s) if !s.is_empty() => Some(s.clone()),
++        _ => None,
++    }
++}
++
++fn character_ids(chara_base: &Path) -> HashMap<i64, String> {
++    let bytes = fs::read(chara_base).expect("could not read chara_base");
++    let db = parse_database(&bytes).expect("could not parse chara_base");
++    let table = db
++        .table("CHARA_BASE_INFO_LIST")
++        .expect("CHARA_BASE_INFO_LIST missing");
++
++    let mut map = HashMap::new();
++    for row in table.rows() {
++        if row.values.len() < 3 {
++            continue;
++        }
++        let Some(index) = parse_int(&row.values[2][0]) else { continue };
++        if index <= 0 {
++            continue;
++        }
++        let Some(id) = parse_string(&row.values[1][0]) else { continue };
++        map.insert(index as i64, id);
++    }
++    map
++}
++
++fn patch_array(rows: &mut [Json], ids: &HashMap<i64, String>) -> (usize, usize) {
++    let mut hit = 0;
++    let mut miss = 0;
++    for row in rows {
++        let Some(object) = row.as_object_mut() else { continue };
++        let Some(index) = object.get("id").and_then(Json::as_i64) else {
++            miss += 1;
++            continue;
++        };
++        match ids.get(&index) {
++            Some(character_id) => {
++                object.insert("character_id".into(), Json::String(character_id.clone()));
++                hit += 1;
++            }
++            None => miss += 1,
++        }
++    }
++    (hit, miss)
++}
++
++fn patch_file(path: &Path, ids: &HashMap<i64, String>) {
++    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++    let text = text.trim_start_matches('\u{feff}');
++    let mut bundle: Json = serde_json::from_str(text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++
++    let Some(root) = bundle.as_object_mut() else {
++        panic!("{}: not a JSON object", path.display());
++    };
++
++    for key in ["characters", "heroes", "basaras"] {
++        match root.get_mut(key).and_then(Json::as_array_mut) {
++            Some(rows) => {
++                let (hit, miss) = patch_array(rows, ids);
++                println!("  {key:<12} +{hit} character_id  ({miss} unmatched)");
++            }
++            None => println!("  {key:<12} (absent)"),
++        }
++    }
++
++    let out = serde_json::to_string(&bundle).expect("serialize");
++    fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
++    println!("  wrote {}", path.display());
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: patch_character_ids <chara_base.cfg.bin> <json_dir>");
++        std::process::exit(1);
++    }
++
++    let ids = character_ids(Path::new(&args[1]));
++    println!("{} character ids from {}", ids.len(), args[1]);
++
++    let dir = Path::new(&args[2]);
++    let mut found = false;
++    for lang in ["en", "fr", "ja", "de", "es", "it", "pt", "zh_hans", "zh_hant"] {
++        let path = dir.join(format!("ievr.{lang}.json"));
++        if path.exists() {
++            found = true;
++            println!("{}", path.display());
++            patch_file(&path, &ids);
++        }
++    }
++
++    if !found {
++        eprintln!("no ievr.*.json in {}", dir.display());
++        std::process::exit(1);
++    }
++}
+diff --git a/src/bin/png_to_svg.rs b/src/bin/png_to_svg.rs
+new file mode 100644
+index 0000000..c6566aa
+--- /dev/null
++++ b/src/bin/png_to_svg.rs
+@@ -0,0 +1,253 @@
++//! Traces monochrome icon PNGs into SVG paths.
++//!
++//! Only silhouettes vectorise usefully: the outline is recovered from the alpha
++//! channel, so a multi-colour sprite would collapse into one flat blob. Images
++//! that are not monochrome are reported and skipped rather than silently
++//! producing a wrong shape.
++
++use std::collections::HashMap;
++use std::env;
++use std::fs::{self, File};
++use std::path::Path;
++
++const ALPHA_CUT: u8 = 128;
++
++struct Image {
++    width: usize,
++    height: usize,
++    pixels: Vec<u8>,
++}
++
++fn read_png(path: &Path) -> Option<Image> {
++    let decoder = png::Decoder::new(File::open(path).ok()?);
++    let mut reader = decoder.read_info().ok()?;
++    let mut buffer = vec![0; reader.output_buffer_size()];
++    let info = reader.next_frame(&mut buffer).ok()?;
++    if info.color_type != png::ColorType::Rgba {
++        return None;
++    }
++    Some(Image {
++        width: info.width as usize,
++        height: info.height as usize,
++        pixels: buffer[..info.buffer_size()].to_vec(),
++    })
++}
++
++/// Spread of hue/'colourfulness' over the opaque pixels. A white or single
++/// tone silhouette scores near zero.
++fn colour_spread(image: &Image) -> f64 {
++    let mut count = 0u64;
++    let mut sum = 0u64;
++
++    for chunk in image.pixels.chunks_exact(4) {
++        if chunk[3] < ALPHA_CUT {
++            continue;
++        }
++        let (r, g, b) = (chunk[0] as i32, chunk[1] as i32, chunk[2] as i32);
++        let max = r.max(g).max(b);
++        let min = r.min(g).min(b);
++        sum += (max - min) as u64;
++        count += 1;
++    }
++
++    if count == 0 { 0.0 } else { sum as f64 / count as f64 }
++}
++
++type Point = (i32, i32);
++
++/// Some icons are a solid light plate carrying a dark figure. Their alpha is
++/// uniform, so tracing it would yield only the plate — the figure has to come
++/// from luminance instead.
++fn dark_on_light(image: &Image) -> bool {
++    let (mut dark, mut opaque) = (0u64, 0u64);
++
++    for chunk in image.pixels.chunks_exact(4) {
++        if chunk[3] < ALPHA_CUT {
++            continue;
++        }
++        opaque += 1;
++        let luma = 0.299 * chunk[0] as f64 + 0.587 * chunk[1] as f64 + 0.114 * chunk[2] as f64;
++        if luma < 128.0 {
++            dark += 1;
++        }
++    }
++
++    let total = (image.width * image.height) as u64;
++    opaque * 100 > total * 80 && dark * 100 > opaque * 5
++}
++
++/// Boundary edges around the inked area, wound consistently so they chain into
++/// closed loops. "Ink" is transparency for cut-out icons, darkness for plates.
++fn boundary_loops(image: &Image, by_luma: bool) -> Vec<Vec<Point>> {
++    let (w, h) = (image.width, image.height);
++    let opaque = |x: i32, y: i32| -> bool {
++        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
++            return false;
++        }
++        if by_luma {
++            let at = (y as usize * w + x as usize) * 4;
++            let p = &image.pixels[at..at + 4];
++            let luma = 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64;
++            return p[3] >= ALPHA_CUT && luma < 128.0;
++        }
++        image.pixels[(y as usize * w + x as usize) * 4 + 3] >= ALPHA_CUT
++    };
++
++    // A vertex where two shapes touch diagonally starts two edges, so the
++    // outgoing edges have to be a list — keying one per point drops geometry.
++    let mut edges: HashMap<Point, Vec<Point>> = HashMap::new();
++    let mut add = |from: Point, to: Point, edges: &mut HashMap<Point, Vec<Point>>| {
++        edges.entry(from).or_default().push(to);
++    };
++
++    for y in 0..h as i32 {
++        for x in 0..w as i32 {
++            if !opaque(x, y) {
++                continue;
++            }
++            if !opaque(x, y - 1) { add((x, y), (x + 1, y), &mut edges); }
++            if !opaque(x + 1, y) { add((x + 1, y), (x + 1, y + 1), &mut edges); }
++            if !opaque(x, y + 1) { add((x + 1, y + 1), (x, y + 1), &mut edges); }
++            if !opaque(x - 1, y) { add((x, y + 1), (x, y), &mut edges); }
++        }
++    }
++
++    let mut loops = Vec::new();
++    loop {
++        let Some(start) = edges
++            .iter()
++            .find(|(_, outgoing)| !outgoing.is_empty())
++            .map(|(point, _)| *point)
++        else {
++            break;
++        };
++
++        let mut loop_points = vec![start];
++        let mut current = start;
++
++        loop {
++            let Some(outgoing) = edges.get_mut(&current) else { break };
++            let Some(next) = outgoing.pop() else { break };
++
++            if next == start {
++                break;
++            }
++            loop_points.push(next);
++            current = next;
++        }
++
++        if loop_points.len() >= 4 {
++            loops.push(loop_points);
++        }
++    }
++
++    loops
++}
++
++fn perpendicular_distance(p: Point, a: Point, b: Point) -> f64 {
++    let (px, py) = (p.0 as f64, p.1 as f64);
++    let (ax, ay) = (a.0 as f64, a.1 as f64);
++    let (bx, by) = (b.0 as f64, b.1 as f64);
++    let (dx, dy) = (bx - ax, by - ay);
++    let len = (dx * dx + dy * dy).sqrt();
++    if len == 0.0 {
++        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
++    }
++    ((dx * (ay - py) - (ax - px) * dy) / len).abs()
++}
++
++fn simplify(points: &[Point], epsilon: f64) -> Vec<Point> {
++    if points.len() < 3 {
++        return points.to_vec();
++    }
++
++    let (mut index, mut furthest) = (0usize, 0.0f64);
++    let last = points.len() - 1;
++    for i in 1..last {
++        let d = perpendicular_distance(points[i], points[0], points[last]);
++        if d > furthest {
++            furthest = d;
++            index = i;
++        }
++    }
++
++    if furthest > epsilon {
++        let mut left = simplify(&points[..=index], epsilon);
++        let right = simplify(&points[index..], epsilon);
++        left.pop();
++        left.extend(right);
++        left
++    } else {
++        vec![points[0], points[last]]
++    }
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: png_to_svg <in_dir> <out_dir> [epsilon] [max_colour_spread]");
++        std::process::exit(1);
++    }
++
++    let epsilon: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.8);
++    let max_spread: f64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(24.0);
++
++    let in_dir = Path::new(&args[1]);
++    let out_dir = Path::new(&args[2]);
++    fs::create_dir_all(out_dir).expect("create out dir");
++
++    let mut files: Vec<_> = fs::read_dir(in_dir)
++        .expect("read in dir")
++        .flatten()
++        .map(|e| e.path())
++        .filter(|p| p.extension().is_some_and(|e| e == "png"))
++        .collect();
++    files.sort();
++
++    let (mut traced, mut skipped) = (0, 0);
++
++    for file in &files {
++        let Some(image) = read_png(file) else { continue };
++
++        let by_luma = dark_on_light(&image);
++
++        let spread = colour_spread(&image);
++        if !by_luma && spread > max_spread {
++            skipped += 1;
++            println!("  skip  {:<28} colour spread {:.1}", file.file_name().unwrap().to_string_lossy(), spread);
++            continue;
++        }
++
++        let paths: Vec<String> = boundary_loops(&image, by_luma)
++            .iter()
++            .map(|points| simplify(points, epsilon))
++            .filter(|points| points.len() >= 3)
++            .map(|points| {
++                let mut d = format!("M{} {}", points[0].0, points[0].1);
++                for p in &points[1..] {
++                    d.push_str(&format!("L{} {}", p.0, p.1));
++                }
++                d.push('Z');
++                d
++            })
++            .collect();
++
++        if paths.is_empty() {
++            skipped += 1;
++            continue;
++        }
++
++        let svg = format!(
++            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" fill=\"currentColor\" fill-rule=\"evenodd\"><path d=\"{}\"/></svg>",
++            image.width,
++            image.height,
++            paths.join("")
++        );
++
++        let target = out_dir.join(file.file_stem().unwrap()).with_extension("svg");
++        fs::write(&target, svg).expect("write svg");
++        traced += 1;
++    }
++
++    println!("\n{traced} traced, {skipped} skipped");
++}
+diff --git a/src/bin/show_table.rs b/src/bin/show_table.rs
+new file mode 100644
+index 0000000..b56505e
+--- /dev/null
++++ b/src/bin/show_table.rs
+@@ -0,0 +1,58 @@
++use std::env;
++use std::fs;
++
++use ievr_cfg_bin_editor_core::{Value, parse_database};
++
++fn render(v: &Value) -> String {
++    match v {
++        Value::Bool(x) => format!("B:{x}"),
++        Value::Byte(x) => format!("u8:{x}"),
++        Value::Int(x) => format!("i:{x}"),
++        Value::Long(x) => format!("l:{x}"),
++        Value::Short(x) => format!("s:{x}"),
++        Value::UInt(x) => format!("u:{x}"),
++        Value::Float(x) => format!("f:{x}"),
++        Value::FloatLong(x) => format!("d:{x}"),
++        Value::String(x) => format!("\"{x}\""),
++        Value::Hash(x) => format!("h:{x}"),
++        Value::Bytes(x) => format!("<{}b>", x.len()),
++        Value::Tuple2I16(a, b) => format!("({a},{b})"),
++        Value::Vec4F32(x) => format!("{x:?}"),
++    }
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: show_table <file.cfg.bin> <table> [rows] [skip]");
++        std::process::exit(1);
++    }
++
++    let take: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
++    let skip: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
++
++    let bytes = fs::read(&args[1]).expect("could not read file");
++    let db = parse_database(&bytes).expect("could not parse");
++
++    let Some(table) = db.table(&args[2]) else {
++        eprintln!("table not found");
++        std::process::exit(1);
++    };
++
++    println!("{} : {} rows", table.name(), table.rows().len());
++
++    let mut widths = std::collections::BTreeMap::new();
++    for row in table.rows() {
++        *widths.entry(row.values.len()).or_insert(0usize) += 1;
++    }
++    println!("column counts: {widths:?}\n");
++
++    for row in table.rows().iter().skip(skip).take(take) {
++        let cells: Vec<String> = row
++            .values
++            .iter()
++            .map(|col| col.iter().map(render).collect::<Vec<_>>().join("/"))
++            .collect();
++        println!("{:<38} {}", row.name, cells.join("  "));
++    }
++}
+diff --git a/src/bin/slice_atlas.rs b/src/bin/slice_atlas.rs
+new file mode 100644
+index 0000000..70fd81f
+--- /dev/null
++++ b/src/bin/slice_atlas.rs
+@@ -0,0 +1,145 @@
++//! Slices a sprite atlas PNG into individual icons.
++//!
++//! The game ships icons as sheets with no coordinates in the texture itself, so
++//! sprites are recovered from the alpha channel: opaque pixels are dilated so
++//! the parts of one icon join up, connected components are labelled, and each
++//! component's bounding box is cropped out of the original image.
++
++use std::collections::VecDeque;
++use std::env;
++use std::fs::{self, File};
++use std::io::BufWriter;
++use std::path::Path;
++
++const ALPHA_FLOOR: u8 = 16;
++
++struct Image {
++    width: usize,
++    height: usize,
++    pixels: Vec<u8>, // RGBA
++}
++
++fn read_png(path: &Path) -> Image {
++    let decoder = png::Decoder::new(File::open(path).expect("open"));
++    let mut reader = decoder.read_info().expect("png header");
++    let mut buffer = vec![0; reader.output_buffer_size()];
++    let info = reader.next_frame(&mut buffer).expect("png data");
++
++    assert!(info.color_type == png::ColorType::Rgba, "expected RGBA");
++
++    Image {
++        width: info.width as usize,
++        height: info.height as usize,
++        pixels: buffer[..info.buffer_size()].to_vec(),
++    }
++}
++
++/// Opaque mask, dilated by `radius` so one icon's disconnected parts merge.
++fn dilated_mask(image: &Image, radius: isize) -> Vec<bool> {
++    let (w, h) = (image.width, image.height);
++    let mut mask = vec![false; w * h];
++
++    for y in 0..h {
++        for x in 0..w {
++            if image.pixels[(y * w + x) * 4 + 3] < ALPHA_FLOOR {
++                continue;
++            }
++            for dy in -radius..=radius {
++                for dx in -radius..=radius {
++                    let nx = x as isize + dx;
++                    let ny = y as isize + dy;
++                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
++                        mask[ny as usize * w + nx as usize] = true;
++                    }
++                }
++            }
++        }
++    }
++
++    mask
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.len() < 3 {
++        eprintln!("usage: slice_atlas <atlas.png> <out_dir> [dilate] [min_size]");
++        std::process::exit(1);
++    }
++
++    let radius: isize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
++    let min_size: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(12);
++
++    let source = Path::new(&args[1]);
++    let out_dir = Path::new(&args[2]);
++    fs::create_dir_all(out_dir).expect("create out dir");
++
++    let image = read_png(source);
++    let (w, h) = (image.width, image.height);
++    let mask = dilated_mask(&image, radius);
++
++    let stem = source.file_stem().unwrap().to_string_lossy().to_string();
++    let mut seen = vec![false; w * h];
++    let mut boxes = Vec::new();
++
++    for start in 0..w * h {
++        if !mask[start] || seen[start] {
++            continue;
++        }
++
++        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
++        let mut queue = VecDeque::new();
++        queue.push_back(start);
++        seen[start] = true;
++
++        while let Some(index) = queue.pop_front() {
++            let (x, y) = (index % w, index / w);
++            x0 = x0.min(x);
++            y0 = y0.min(y);
++            x1 = x1.max(x);
++            y1 = y1.max(y);
++
++            let mut push = |nx: usize, ny: usize, queue: &mut VecDeque<usize>, seen: &mut Vec<bool>| {
++                let n = ny * w + nx;
++                if mask[n] && !seen[n] {
++                    seen[n] = true;
++                    queue.push_back(n);
++                }
++            };
++
++            if x > 0 { push(x - 1, y, &mut queue, &mut seen) }
++            if y > 0 { push(x, y - 1, &mut queue, &mut seen) }
++            if x + 1 < w { push(x + 1, y, &mut queue, &mut seen) }
++            if y + 1 < h { push(x, y + 1, &mut queue, &mut seen) }
++        }
++
++        if x1 - x0 + 1 >= min_size && y1 - y0 + 1 >= min_size {
++            boxes.push((x0, y0, x1, y1));
++        }
++    }
++
++    // Reading order, so the numbering matches how the sheet looks
++    boxes.sort_by_key(|(x0, y0, _, _)| (y0 / 32, *x0));
++
++    for (n, (x0, y0, x1, y1)) in boxes.iter().enumerate() {
++        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
++        let mut crop = Vec::with_capacity(bw * bh * 4);
++
++        for y in *y0..=*y1 {
++            let row = (y * w + x0) * 4;
++            crop.extend_from_slice(&image.pixels[row..row + bw * 4]);
++        }
++
++        let target = out_dir.join(format!("{stem}_{n:03}.png"));
++        let file = File::create(&target).expect("create png");
++        let mut encoder = png::Encoder::new(BufWriter::new(file), bw as u32, bh as u32);
++        encoder.set_color(png::ColorType::Rgba);
++        encoder.set_depth(png::BitDepth::Eight);
++        encoder
++            .write_header()
++            .expect("header")
++            .write_image_data(&crop)
++            .expect("data");
++    }
++
++    println!("{}: {} sprites", stem, boxes.len());
++}
+diff --git a/src/characters.rs b/src/characters.rs
+index b3cf4c7..179cf12 100644
+--- a/src/characters.rs
++++ b/src/characters.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, path::Path, sync::LazyLock};
++﻿use std::{collections::HashMap, path::Path, sync::LazyLock};
+ 
+ use crossbeam::channel::Sender;
+ use ievr_cfg_bin_editor_core::{Row, Table, Value};
+@@ -8,7 +8,20 @@ mod character;
+ pub use character::Character;
+ use rusqlite::{Connection, Result, params};
+ 
+-use crate::common::{Element, parse_byte_value, parse_int_value, parse_uint_value};
++use crate::common::{
++    Element, parse_byte_value, parse_id_value, parse_int_value, parse_string_value, parse_uint_value,
++};
++
++/// A club from belong_team_config. The game ships one emblem per era of the
++/// series, so a team can have up to four.
++pub struct Team {
++    pub(crate) team_id: i32,
++    pub(crate) name_id: i32,
++    pub(crate) emblem_ie: i32,
++    pub(crate) emblem_go: i32,
++    pub(crate) emblem_areori: i32,
++    pub(crate) emblem_v: i32,
++}
+ pub use crate::{characters::character::{Position, Stats, Style}, common::parse_gamefile};
+ 
+ pub const CHARA_ROOT_PATH: &str = "data/common/gamedata/character/";
+@@ -18,6 +31,7 @@ pub static CHARA_REQUIRED_FILES: LazyLock<HashMap<&'static str, &'static str>> =
+     map.insert("chara_base", "^chara_base_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
+     map.insert("chara_param", "^chara_param_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
+     map.insert("chara_series", "^chara_series_config.cfg.bin$");
++    map.insert("belong_team", "^belong_team_config_\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
+     map.insert("growth_table", "^growth_table_config_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
+     map
+ });
+@@ -63,12 +77,21 @@ pub fn populate_character_data(extraction_path: &Path, mut character_database_co
+ 
+     let mut ignored_characters = 0;
+ 
++    // Which club a character comes from â€” column 16, right beside the series id
++    let mut team_buffer: Vec<(i32, i32)> = Vec::with_capacity(6000);
++
+     for row in chara_base_info {
+         let index = parse_int_value(&row.values[2][0]);
++        let character_id = parse_string_value(&row.values[1][0]);
+ 
+         let name_id = parse_int_value(&row.values[3][0]);
+         let description_id = parse_int_value(&row.values[19][0]);
+ 
++        let belong_team_id = parse_int_value(&row.values[16][0]);
++        if belong_team_id != 0 {
++            team_buffer.push((index, belong_team_id));
++        }
++
+         let series_id = match series_text_hash_table.get(&parse_int_value(&row.values[15][0])) {
+             Some(v) => *v,
+             None => continue, // If the character doesn't have a valid series ID it is not worth investigating
+@@ -81,7 +104,15 @@ pub fn populate_character_data(extraction_path: &Path, mut character_database_co
+             if row.values.len() == 1 { continue } // This skips the __SORT_INDEX entries
+             
+             if parse_int_value(&row.values[1][0]) == chara_base_id {                
+-                if let Some(character) = extract_character(index, name_id, description_id, series_id, row, &growth_hash_table) {
++                if let Some(character) = extract_character(
++                    index,
++                    character_id.clone(),
++                    name_id,
++                    description_id,
++                    series_id,
++                    row,
++                    &growth_hash_table,
++                ) {
+                     let rarity = parse_int_value(&row.values[41][0]);
+ 
+                     if !found_char {
+@@ -113,7 +144,30 @@ pub fn populate_character_data(extraction_path: &Path, mut character_database_co
+     insert_heroes(&mut character_database_connection, &hero_buffer).unwrap();
+     insert_basaras(&mut character_database_connection, &basara_buffer).unwrap();
+ 
++    insert_character_teams(&mut character_database_connection, &team_buffer).unwrap();
++
++    let belong_team_config = parse_gamefile(&root_path.join(&requested_files["belong_team"])).unwrap();
++    let belong_team_list = belong_team_config.table("m_belongTeamInfoList").unwrap();
++
++    let mut teams = Vec::with_capacity(belong_team_list.rows().len());
++    for row in belong_team_list.rows() {
++        // id, name, then one emblem per era of the series
++        if row.values.len() < 7 { continue }
++
++        teams.push(Team {
++            team_id: parse_id_value(&row.values[0][0]),
++            name_id: parse_id_value(&row.values[2][0]),
++            emblem_ie: parse_id_value(&row.values[3][0]),
++            emblem_go: parse_id_value(&row.values[4][0]),
++            emblem_areori: parse_id_value(&row.values[5][0]),
++            emblem_v: parse_id_value(&row.values[6][0]),
++        });
++    }
++
++    insert_teams(&mut character_database_connection, &teams).unwrap();
++
+     println!("[CHARACTERS]: {ignored_characters} character(s) ignored for being invalid.");
++    println!("[TEAMS]: {} teams, {} character affiliations.", teams.len(), team_buffer.len());
+ }
+ 
+ fn get_characters(chara_base_info: &Table) -> Vec<&Row> {
+@@ -189,7 +243,7 @@ fn parse_series_info(chara_series_config_table: &Table) -> HashMap<i32, i32> {
+     series_hash_map
+ }
+ 
+-fn extract_character(index: i32, name_id: i32, description_id: i32, series_id: i32, row: &Row, growth_hash_table: &HashMap<(u8, u8, u8), (Stats, Stats)>) -> Option<Character> {
++fn extract_character(index: i32, character_id: String, name_id: i32, description_id: i32, series_id: i32, row: &Row, growth_hash_table: &HashMap<(u8, u8, u8), (Stats, Stats)>) -> Option<Character> {
+     let rarity = parse_int_value(&row.values[41][0]);
+ 
+     let skill_slice: Vec<i32> = row.values[23..=28].iter()// We filter by making sure the character has a second technique path
+@@ -222,6 +276,7 @@ fn extract_character(index: i32, name_id: i32, description_id: i32, series_id: i
+ 
+     Some(Character {
+         index,
++        character_id,
+         name_id,
+         description_id,
+         element,
+@@ -234,10 +289,63 @@ fn extract_character(index: i32, name_id: i32, description_id: i32, series_id: i
+     })
+ }
+ 
++fn insert_character_teams(conn: &mut Connection, pairs: &Vec<(i32, i32)>) -> Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++    {
++        let mut stmt = tx.prepare_cached(
++            "INSERT INTO character_teams (index_id, team_id) VALUES (?1, ?2)
++             ON CONFLICT(index_id) DO NOTHING",
++        )?;
++        for (index, team) in pairs {
++            stmt.execute(params![index, team])?;
++        }
++    }
++    tx.commit()
++}
++
++fn insert_teams(conn: &mut Connection, teams: &Vec<Team>) -> Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++    {
++        let mut stmt = tx.prepare_cached(
++            "INSERT INTO teams (
++                team_id, name_id, emblem_ie, emblem_go, emblem_areori, emblem_v
++             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
++             ON CONFLICT(team_id) DO NOTHING",
++        )?;
++        for t in teams {
++            stmt.execute(params![
++                t.team_id, t.name_id, t.emblem_ie, t.emblem_go, t.emblem_areori, t.emblem_v
++            ])?;
++        }
++    }
++    tx.commit()
++}
++
+ fn initialize_database(database: &Connection) -> Result<()> {
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS teams (
++            team_id         INTEGER PRIMARY KEY,
++            name_id         INTEGER NOT NULL,
++            emblem_ie       INTEGER NOT NULL,
++            emblem_go       INTEGER NOT NULL,
++            emblem_areori   INTEGER NOT NULL,
++            emblem_v        INTEGER NOT NULL
++        );",
++        (),
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS character_teams (
++            index_id        INTEGER PRIMARY KEY,
++            team_id         INTEGER NOT NULL
++        );",
++        (),
++    )?;
++
+     database.execute(
+         "CREATE TABLE IF NOT EXISTS characters (
+             index_id        INTEGER PRIMARY KEY,
++            character_id    TEXT NOT NULL,
+             name_id         INTEGER NOT NULL,
+             description_id  INTEGER NOT NULL,
+             element         INTEGER NOT NULL,
+@@ -268,6 +376,7 @@ fn initialize_database(database: &Connection) -> Result<()> {
+     database.execute(
+         "CREATE TABLE IF NOT EXISTS heroes (
+             index_id        INTEGER NOT NULL,
++            character_id    TEXT NOT NULL,
+             name_id         INTEGER NOT NULL,
+             description_id  INTEGER NOT NULL,
+             element         INTEGER NOT NULL,
+@@ -298,6 +407,7 @@ fn initialize_database(database: &Connection) -> Result<()> {
+     database.execute(
+         "CREATE TABLE IF NOT EXISTS basaras (
+             index_id        INTEGER NOT NULL,
++            character_id    TEXT NOT NULL,
+             name_id         INTEGER NOT NULL,
+             description_id  INTEGER NOT NULL,
+             element         INTEGER NOT NULL,
+@@ -334,14 +444,14 @@ fn insert_characters(conn: &mut Connection, characters: &Vec<Character>) -> rusq
+     {
+         let mut stmt = tx.prepare_cached(
+             "INSERT INTO characters (
+-                index_id, name_id, description_id, element, main_position, alt_position, style, series_id,
++                index_id, character_id, name_id, description_id, element, main_position, alt_position, style, series_id,
+                 lvl50_kick, lvl50_control, lvl50_technique, lvl50_pressure,
+                 lvl50_physical, lvl50_agility, lvl50_intelligence,
+                 lvl99_kick, lvl99_control, lvl99_technique, lvl99_pressure,
+                 lvl99_physical, lvl99_agility, lvl99_intelligence
+-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 
+-                        ?9, ?10, ?11, ?12, ?13, ?14, ?15, 
+-                        ?16, ?17, ?18, ?19, ?20, ?21, ?22)
++            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
++                        ?10, ?11, ?12, ?13, ?14, ?15, ?16,
++                        ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+             ON CONFLICT(index_id) DO NOTHING"
+         )?;
+ 
+@@ -349,6 +459,7 @@ fn insert_characters(conn: &mut Connection, characters: &Vec<Character>) -> rusq
+             stmt.execute(
+                 params![
+                     c.index,
++                    c.character_id,
+                     c.name_id,
+                     c.description_id,
+                     c.element as i32,
+@@ -386,20 +497,21 @@ fn insert_heroes(conn: &mut Connection, characters: &Vec<Character>) -> rusqlite
+     {
+         let mut stmt = tx.prepare_cached(
+             "INSERT INTO heroes (
+-                index_id, name_id, description_id, element, main_position, alt_position, style, series_id,
++                index_id, character_id, name_id, description_id, element, main_position, alt_position, style, series_id,
+                 lvl50_kick, lvl50_control, lvl50_technique, lvl50_pressure,
+                 lvl50_physical, lvl50_agility, lvl50_intelligence,
+                 lvl99_kick, lvl99_control, lvl99_technique, lvl99_pressure,
+                 lvl99_physical, lvl99_agility, lvl99_intelligence
+-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 
+-                        ?9, ?10, ?11, ?12, ?13, ?14, ?15, 
+-                        ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
++            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
++                        ?10, ?11, ?12, ?13, ?14, ?15, ?16,
++                        ?17, ?18, ?19, ?20, ?21, ?22, ?23)"
+         )?;
+ 
+         for c in characters {
+             stmt.execute(
+                 params![
+                     c.index,
++                    c.character_id,
+                     c.name_id,
+                     c.description_id,
+                     c.element as i32,
+@@ -437,20 +549,21 @@ fn insert_basaras(conn: &mut Connection, characters: &Vec<Character>) -> rusqlit
+     {
+         let mut stmt = tx.prepare_cached(
+             "INSERT INTO basaras (
+-                index_id, name_id, description_id, element, main_position, alt_position, style, series_id,
++                index_id, character_id, name_id, description_id, element, main_position, alt_position, style, series_id,
+                 lvl50_kick, lvl50_control, lvl50_technique, lvl50_pressure,
+                 lvl50_physical, lvl50_agility, lvl50_intelligence,
+                 lvl99_kick, lvl99_control, lvl99_technique, lvl99_pressure,
+                 lvl99_physical, lvl99_agility, lvl99_intelligence
+-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 
+-                        ?9, ?10, ?11, ?12, ?13, ?14, ?15, 
+-                        ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
++            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
++                        ?10, ?11, ?12, ?13, ?14, ?15, ?16,
++                        ?17, ?18, ?19, ?20, ?21, ?22, ?23)"
+         )?;
+ 
+         for c in characters {
+             stmt.execute(
+                 params![
+                     c.index,
++                    c.character_id,
+                     c.name_id,
+                     c.description_id,
+                     c.element as i32,
+@@ -481,3 +594,4 @@ fn insert_basaras(conn: &mut Connection, characters: &Vec<Character>) -> rusqlit
+     
+     tx.commit()
+ }
++
+diff --git a/src/characters/character.rs b/src/characters/character.rs
+index a5c1a7c..69afde9 100644
+--- a/src/characters/character.rs
++++ b/src/characters/character.rs
+@@ -3,6 +3,8 @@ use crate::common::Element;
+ #[derive(Debug)]
+ pub struct Character {
+     pub index: i32,
++    /// Game string id (`c01000010`) — the key Inazugle uses for 3D models.
++    pub character_id: String,
+     pub name_id: i32,
+     pub description_id: i32,
+     pub element: Element,
+diff --git a/src/common.rs b/src/common.rs
+index b225677..43abe60 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -53,6 +53,28 @@ pub fn parse_f32_value(value: &Value) -> f32 {
+     }
+ }
+ 
++/// Hash columns come back as unsigned, plain id columns as signed.
++pub fn parse_id_value(value: &Value) -> i32 {
++    match value {
++        Value::UInt(v) => v.cast_signed(),
++        Value::Hash(v) => v.cast_signed(),
++        Value::Int(v) => *v,
++        _ => unreachable!()
++    }
++}
++
++/// T2B stores whole numbers as integers, so a numeric column is not
++/// guaranteed to hold the same variant on every row.
++pub fn parse_number_value(value: &Value) -> f32 {
++    match value {
++        Value::Float(v) => *v,
++        Value::FloatLong(v) => *v as f32,
++        Value::Int(v) => *v as f32,
++        Value::Long(v) => *v as f32,
++        _ => unreachable!()
++    }
++}
++
+ pub fn parse_short_value(value: &Value) -> i16 {
+     match value {
+         Value::Short(v) => *v,
+diff --git a/src/main.rs b/src/main.rs
+index 7d05dcb..be702c6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,4 @@
+-use crossbeam::channel::{self, Receiver, Sender};
++﻿use crossbeam::channel::{self, Receiver, Sender};
+ use rusqlite::Connection;
+ 
+ mod characters;
+@@ -149,7 +149,7 @@ fn create_text_thread(
+     output_folder_path: &Path,
+     extraction_root_path: &Arc<PathBuf>,
+     char_name_req_rx: Receiver<(i32, i32)>,
+-    skill_name_req_rx: Receiver<i32>,
++    skill_name_req_rx: Receiver<(i32, i32)>,
+ ) -> JoinHandle<()> {
+     let text_requested_files = check_text_files_existence(&extraction_root_path).unwrap();
+ 
+@@ -181,7 +181,7 @@ fn create_text_thread(
+ fn create_skill_thread(
+     output_folder_path: &Path,
+     extraction_root_path: &Arc<PathBuf>,
+-    skill_name_req_tx: Sender<i32>,
++    skill_name_req_tx: Sender<(i32, i32)>,
+ ) -> JoinHandle<()> {
+     let skill_database = Connection::open(output_folder_path.join(DATABASES[1])).unwrap();
+ 
+@@ -289,3 +289,4 @@ fn pause() {
+         .read_line(&mut _unused)
+         .expect("Failed to read line");
+ }
++
+diff --git a/src/skills.rs b/src/skills.rs
+index 5ffdde1..ad9508d 100644
+--- a/src/skills.rs
++++ b/src/skills.rs
+@@ -1,25 +1,36 @@
+-use std::{collections::{HashMap, HashSet}, path::Path, sync::LazyLock};
++﻿use std::{collections::{HashMap, HashSet}, path::Path, sync::LazyLock};
+ 
+ use crossbeam::channel::Sender;
+ use rusqlite::{Connection, params};
+ 
+-use crate::{common::parse_gamefile, skills::hissatsu::Category};
++use crate::{common::{parse_gamefile, parse_id_value, parse_int_value}, skills::hissatsu::Category};
+ 
+ mod hissatsu;
+ mod aura;
++mod passive;
++mod tactic;
++mod equipment;
+ use hissatsu::Hissatsu;
+ use aura::Aura;
++use passive::{Passive, PassiveEffect, PassiveTier};
++use tactic::{Synergy, Tactic};
++use equipment::Equipment;
+ 
+ pub const SKILL_ROOT_PATH: &str = "data/common/gamedata/skill/";
++/// Synergies are stored as items, so one config is read from here instead
++pub const ITEM_ROOT_PATH: &str = "data/common/gamedata/item/";
+ 
+ pub static SKILL_REQUIRED_FILES: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+     let mut map = HashMap::new();
+     map.insert("skill_config", "^skill_config_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
+     map.insert("aura_skill_config", "^aura_skill_config_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
++    map.insert("passive_skill_config", "^passive_skill_config_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
++    map.insert("passive_skill_rarity_table_config", "^passive_skill_rarity_table_config_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
++    map.insert("special_tactics_config", "^special_tactics_config_\\d+\\.\\d+\\.\\d+\\.\\d+\\.cfg\\.bin$");
+     map
+ });
+ 
+-pub fn populate_skill_data(extraction_path: &Path, mut skill_database_connection: Connection, requested_files: HashMap<&'static str, String>, skill_name_req_tx: Sender<i32>) {
++pub fn populate_skill_data(extraction_path: &Path, mut skill_database_connection: Connection, requested_files: HashMap<&'static str, String>, skill_name_req_tx: Sender<(i32, i32)>) {
+     initialize_database(&mut skill_database_connection).unwrap();
+ 
+     let root_path = extraction_path.to_path_buf().join(SKILL_ROOT_PATH);
+@@ -36,7 +47,7 @@ pub fn populate_skill_data(extraction_path: &Path, mut skill_database_connection
+         let skill = Hissatsu::from(row);
+ 
+         if skill_names.insert(skill.name_id) {
+-            skill_name_req_tx.send(skill.name_id).unwrap()
++            skill_name_req_tx.send((skill.name_id, skill.description_id)).unwrap()
+         }
+ 
+         match skill.category {
+@@ -59,7 +70,7 @@ pub fn populate_skill_data(extraction_path: &Path, mut skill_database_connection
+             let aura = Aura::from(row);
+ 
+             if skill_names.insert(aura.name_id) {
+-                skill_name_req_tx.send(aura.name_id).unwrap()
++                skill_name_req_tx.send((aura.name_id, aura.description_id)).unwrap()
+             }
+ 
+             aura_buffer.push(aura);
+@@ -67,6 +78,161 @@ pub fn populate_skill_data(extraction_path: &Path, mut skill_database_connection
+     }
+ 
+     insert_aura(&mut skill_database_connection, &aura_buffer).unwrap();
++
++    let passive_skill_config = parse_gamefile(&root_path.join(&requested_files["passive_skill_config"])).unwrap();
++
++    // The effects are read first so that every passive can resolve its own magnitude
++    let passive_effect_list = passive_skill_config.table("PASSIVE_SKILL_EFFECT_LIST").unwrap();
++
++    let mut effect_buffer = Vec::with_capacity(passive_effect_list.rows().len());
++    for row in passive_effect_list.rows() {
++        if row.values.len() == PassiveEffect::COLUMNS {
++            effect_buffer.push(PassiveEffect::from(row));
++        }
++    }
++
++    insert_passive_effects(&mut skill_database_connection, &effect_buffer).unwrap();
++
++    // Buff icons are addressed by index too, so the list is read up front
++    let buff_icons: Vec<i32> = passive_skill_config
++        .table("PASSIVE_SKILL_BUFF_ICON_LIST")
++        .map(|table| {
++            table
++                .rows()
++                .iter()
++                .filter(|row| row.name == "PASSIVE_SKILL_BUFF_ICON" && row.values.len() == 1)
++                .map(|row| parse_int_value(&row.values[0][0]))
++                .collect()
++        })
++        .unwrap_or_default();
++
++    let passive_info_list = passive_skill_config.table("PASSIVE_SKILL_INFO_LIST").unwrap();
++
++    // A passive is spread over several rows: the PASSIVE_SKILL_INFO row itself,
++    // then sub rows referencing the buff icon and the effect lists.
++    let mut passive_buffer = Vec::with_capacity(passive_info_list.rows().len() / 4);
++    for row in passive_info_list.rows() {
++        if row.name == Passive::ROW && row.values.len() == Passive::COLUMNS {
++            let passive = Passive::from(row);
++
++            // Passives carry no description id: their name already is the effect text
++            if skill_names.insert(passive.name_id) {
++                skill_name_req_tx.send((passive.name_id, 0)).unwrap()
++            }
++
++            passive_buffer.push(passive);
++        } else if row.name == Passive::ICON_REF_ROW && row.values.len() == 2 {
++            let Some(passive) = passive_buffer.last_mut() else { continue };
++
++            let index = parse_int_value(&row.values[0][0]);
++            let count = parse_int_value(&row.values[1][0]);
++
++            if count > 0 {
++                passive.buff_icon = buff_icons.get(index as usize).copied();
++            }
++        } else if row.name == Passive::EFFECT_REF_ROW && row.values.len() == 2 {
++            let Some(passive) = passive_buffer.last_mut() else { continue };
++
++            passive.effect_index = parse_int_value(&row.values[0][0]);
++            passive.effect_count = parse_int_value(&row.values[1][0]);
++
++            if passive.effect_count > 0 {
++                passive.value = effect_buffer
++                    .get(passive.effect_index as usize)
++                    .map(|effect| effect.value);
++            }
++        }
++    }
++
++    insert_passive_skills(&mut skill_database_connection, &passive_buffer).unwrap();
++
++    let rarity_table_config = parse_gamefile(&root_path.join(&requested_files["passive_skill_rarity_table_config"])).unwrap();
++
++    let rarity_table_list = rarity_table_config.table("m_passiveSkillRarityTableList").unwrap();
++
++    let mut tier_buffer = Vec::with_capacity(rarity_table_list.rows().len() * PassiveTier::SLOTS);
++    for (family_index, row) in rarity_table_list.rows().iter().enumerate() {
++        for (tier, value) in row.values[0].iter().enumerate() {
++            let passive_id = parse_id_value(value);
++
++            // The id list is zero padded up to PassiveTier::SLOTS
++            if passive_id != 0 {
++                tier_buffer.push(PassiveTier {
++                    family_index: family_index as i32,
++                    tier: tier as i32,
++                    passive_id,
++                });
++            }
++        }
++    }
++
++    insert_passive_tiers(&mut skill_database_connection, &tier_buffer).unwrap();
++
++    let tactics_config = parse_gamefile(&root_path.join(&requested_files["special_tactics_config"])).unwrap();
++    let tactics_list = tactics_config.table("SPECIAL_TACTICS_INFO_LIST").unwrap();
++
++    let tactics: Vec<Tactic> = tactics_list
++        .rows()
++        .iter()
++        .filter(|row| row.name == Tactic::ROW && row.values.len() == Tactic::COLUMNS)
++        .map(Tactic::from)
++        .collect();
++
++    insert_tactics(&mut skill_database_connection, &tactics).unwrap();
++
++    // Synergies and equipment are filed as items, so they live in item_config,
++    // one directory over from the skill configs.
++    let item_root = extraction_path.to_path_buf().join(ITEM_ROOT_PATH);
++    let item_config = std::fs::read_dir(&item_root)
++        .ok()
++        .and_then(|entries| {
++            entries.flatten().find(|e| {
++                e.file_name().to_string_lossy().starts_with("item_config_")
++            })
++        })
++        .and_then(|entry| parse_gamefile(&entry.path()));
++
++    let synergies = item_config
++        .as_ref()
++        .and_then(|config| {
++            config.table("ITEM_SYNERGY_FLAG_INFO_LIST").map(|table| {
++                table
++                    .rows()
++                    .iter()
++                    .filter(|row| row.name == Synergy::ROW && row.values.len() == Synergy::COLUMNS)
++                    .map(Synergy::from)
++                    .collect::<Vec<_>>()
++            })
++        })
++        .unwrap_or_default();
++
++    insert_synergies(&mut skill_database_connection, &synergies).unwrap();
++
++    let mut equipment = Vec::new();
++    if let Some(config) = item_config.as_ref() {
++        for (table_name, slot, info_row, stat_row) in Equipment::SLOTS {
++            let Some(table) = config.table(table_name) else { continue };
++
++            for row in table.rows() {
++                if row.name == info_row && row.values.len() == Equipment::COLUMNS {
++                    equipment.push(Equipment::from_row(row, slot));
++                } else if row.name == stat_row {
++                    if let Some(item) = equipment.last_mut() {
++                        item.read_stats(row);
++                    }
++                }
++            }
++        }
++    }
++
++    insert_equipment(&mut skill_database_connection, &equipment).unwrap();
++
++    println!(
++        "[ITEMS]: {} tactics, {} synergies, {} equipment.",
++        tactics.len(),
++        synergies.len(),
++        equipment.len()
++    );
+ }
+ 
+ fn initialize_database(database: &mut Connection) -> rusqlite::Result<()> {
+@@ -122,7 +288,90 @@ fn initialize_database(database: &mut Connection) -> rusqlite::Result<()> {
+             name_id         INTEGER NOT NULL,
+             skill_id        INTEGER,
+             element         INTEGER NOT NULL
+-        );", 
++        );",
++    ()
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS passive_skills (
++            passive_id      INTEGER PRIMARY KEY,
++            name_id         INTEGER NOT NULL,
++            string_id       TEXT NOT NULL,
++            category        INTEGER NOT NULL,
++            rank_type       INTEGER NOT NULL,
++            link_id_1       INTEGER NOT NULL,
++            link_id_2       INTEGER NOT NULL,
++            effect_index    INTEGER NOT NULL,
++            effect_count    INTEGER NOT NULL,
++            buff_icon       INTEGER,
++            value           REAL
++        );",
++    ()
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS equipment (
++            item_id         INTEGER PRIMARY KEY,
++            slot            TEXT NOT NULL,
++            string_id       TEXT NOT NULL,
++            name_id         INTEGER NOT NULL,
++            description_id  INTEGER NOT NULL,
++            kick            INTEGER NOT NULL,
++            control         INTEGER NOT NULL,
++            technique       INTEGER NOT NULL,
++            pressure        INTEGER NOT NULL,
++            physical        INTEGER NOT NULL,
++            agility         INTEGER NOT NULL,
++            intelligence    INTEGER NOT NULL
++        );",
++    ()
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS tactics (
++            tactic_id       INTEGER PRIMARY KEY,
++            string_id       TEXT NOT NULL,
++            name_id         INTEGER NOT NULL,
++            description_id  INTEGER NOT NULL,
++            tp_cost         REAL NOT NULL,
++            duration        REAL NOT NULL
++        );",
++    ()
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS synergies (
++            synergy_id      INTEGER PRIMARY KEY,
++            item_id         INTEGER NOT NULL,
++            string_id       TEXT NOT NULL,
++            name_id         INTEGER NOT NULL,
++            description_id  INTEGER NOT NULL
++        );",
++    ()
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS passive_rarity_tiers (
++            family_index    INTEGER NOT NULL,
++            tier            INTEGER NOT NULL,
++            passive_id      INTEGER NOT NULL,
++            PRIMARY KEY (family_index, tier)
++        );",
++    ()
++    )?;
++
++    database.execute(
++        "CREATE TABLE IF NOT EXISTS passive_skill_effects (
++            effect_id       INTEGER NOT NULL,
++            value           REAL NOT NULL,
++            param_1         INTEGER NOT NULL,
++            param_2         INTEGER NOT NULL,
++            param_3         INTEGER NOT NULL,
++            param_4         INTEGER NOT NULL,
++            param_5         INTEGER NOT NULL,
++            param_6         INTEGER NOT NULL,
++            param_7         INTEGER NOT NULL
++        );",
+     ()
+     )?;
+ 
+@@ -242,6 +491,167 @@ fn insert_passives(conn: &mut Connection, passives: &Vec<Hissatsu>) -> rusqlite:
+     tx.commit()
+ }
+ 
++fn insert_passive_skills(conn: &mut Connection, passives: &Vec<Passive>) -> rusqlite::Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++
++    {
++        let mut stmt = tx.prepare_cached(
++        "INSERT INTO passive_skills (
++        passive_id,
++        name_id,
++        string_id,
++        category,
++        rank_type,
++        link_id_1,
++        link_id_2,
++        effect_index,
++        effect_count,
++        buff_icon,
++        value
++        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
++        ON CONFLICT(passive_id) DO NOTHING"
++        )?;
++
++        for p in passives {
++            stmt.execute(
++                params![
++                    p.passive_id,
++                    p.name_id,
++                    p.string_id,
++                    p.category,
++                    p.rank_type,
++                    p.link_id_1,
++                    p.link_id_2,
++                    p.effect_index,
++                    p.effect_count,
++                    p.buff_icon,
++                    p.value
++                ],
++            )?;
++        }
++    }
++
++    tx.commit()
++}
++
++fn insert_equipment(conn: &mut Connection, items: &Vec<Equipment>) -> rusqlite::Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++    {
++        let mut stmt = tx.prepare_cached(
++        "INSERT INTO equipment (
++        item_id, slot, string_id, name_id, description_id,
++        kick, control, technique, pressure, physical, agility, intelligence
++        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
++        ON CONFLICT(item_id) DO NOTHING"
++        )?;
++
++        for e in items {
++            stmt.execute(params![
++                e.item_id, e.slot, e.string_id, e.name_id, e.description_id,
++                e.stats[0], e.stats[1], e.stats[2], e.stats[3], e.stats[4], e.stats[5], e.stats[6]
++            ])?;
++        }
++    }
++    tx.commit()
++}
++
++fn insert_tactics(conn: &mut Connection, tactics: &Vec<Tactic>) -> rusqlite::Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++    {
++        let mut stmt = tx.prepare_cached(
++        "INSERT INTO tactics (
++        tactic_id, string_id, name_id, description_id, tp_cost, duration
++        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
++        ON CONFLICT(tactic_id) DO NOTHING"
++        )?;
++
++        for t in tactics {
++            stmt.execute(params![
++                t.tactic_id, t.string_id, t.name_id, t.description_id, t.tp_cost, t.duration
++            ])?;
++        }
++    }
++    tx.commit()
++}
++
++fn insert_synergies(conn: &mut Connection, synergies: &Vec<Synergy>) -> rusqlite::Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++    {
++        let mut stmt = tx.prepare_cached(
++        "INSERT INTO synergies (
++        synergy_id, item_id, string_id, name_id, description_id
++        ) VALUES (?1, ?2, ?3, ?4, ?5)
++        ON CONFLICT(synergy_id) DO NOTHING"
++        )?;
++
++        for s in synergies {
++            stmt.execute(params![
++                s.synergy_id, s.item_id, s.string_id, s.name_id, s.description_id
++            ])?;
++        }
++    }
++    tx.commit()
++}
++
++fn insert_passive_tiers(conn: &mut Connection, tiers: &Vec<PassiveTier>) -> rusqlite::Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++
++    {
++        let mut stmt = tx.prepare_cached(
++        "INSERT INTO passive_rarity_tiers (
++        family_index,
++        tier,
++        passive_id
++        ) VALUES (?1, ?2, ?3)
++        ON CONFLICT(family_index, tier) DO NOTHING"
++        )?;
++
++        for t in tiers {
++            stmt.execute(params![t.family_index, t.tier, t.passive_id])?;
++        }
++    }
++
++    tx.commit()
++}
++
++fn insert_passive_effects(conn: &mut Connection, effects: &Vec<PassiveEffect>) -> rusqlite::Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
++
++    {
++        let mut stmt = tx.prepare_cached(
++        "INSERT INTO passive_skill_effects (
++        effect_id,
++        value,
++        param_1,
++        param_2,
++        param_3,
++        param_4,
++        param_5,
++        param_6,
++        param_7
++        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
++        )?;
++
++        for e in effects {
++            stmt.execute(
++                params![
++                    e.effect_id,
++                    e.value,
++                    e.params[0],
++                    e.params[1],
++                    e.params[2],
++                    e.params[3],
++                    e.params[4],
++                    e.params[5],
++                    e.params[6]
++                ],
++            )?;
++        }
++    }
++
++    tx.commit()
++}
++
+ fn insert_aura(conn: &mut Connection, auras: &Vec<Aura>) -> rusqlite::Result<()> {
+     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+ 
+@@ -269,4 +679,6 @@ fn insert_aura(conn: &mut Connection, auras: &Vec<Aura>) -> rusqlite::Result<()>
+     }
+     
+     tx.commit()
+-}
+\ No newline at end of file
++}
++
++
+diff --git a/src/skills/aura.rs b/src/skills/aura.rs
+index 0381c58..7bdbf05 100644
+--- a/src/skills/aura.rs
++++ b/src/skills/aura.rs
+@@ -5,6 +5,7 @@ use crate::common::{Element, parse_int_value};
+ pub struct Aura {
+     pub(crate) aura_id: i32,
+     pub(crate) name_id: i32,
++    pub(crate) description_id: i32,
+     pub(crate) skill_id: Option<i32>,
+     pub(crate) element: Element
+ }
+@@ -14,6 +15,7 @@ impl From<&Row> for Aura {
+         Aura {
+             aura_id: parse_int_value(&row.values[0][0]),
+             name_id: parse_int_value(&row.values[2][0]),
++            description_id: parse_int_value(&row.values[3][0]),
+             skill_id: {
+                 let value = parse_int_value(&row.values[6][0]);
+                 if value != 0 { Some(value) } else { None }
+diff --git a/src/skills/equipment.rs b/src/skills/equipment.rs
+new file mode 100644
+index 0000000..375e717
+--- /dev/null
++++ b/src/skills/equipment.rs
+@@ -0,0 +1,49 @@
++use ievr_cfg_bin_editor_core::Row;
++
++use crate::common::{parse_int_value, parse_string_value};
++
++/// A piece of equipment from item_config. The game splits them across one table
++/// per slot, all with the same shape: an INFO row carrying the identifiers, then
++/// a REGULAR_UNIQUE_BASE sub row carrying the stat bonuses.
++pub struct Equipment {
++    pub(crate) item_id: i32,
++    pub(crate) slot: &'static str,
++    pub(crate) string_id: String,
++    pub(crate) name_id: i32,
++    pub(crate) description_id: i32,
++    pub(crate) stats: [i32; Equipment::STATS],
++}
++
++impl Equipment {
++    pub const COLUMNS: usize = 19;
++    pub const STATS: usize = 7;
++
++    /// table, slot, info row, stat sub row
++    pub const SLOTS: [(&'static str, &'static str, &'static str, &'static str); 4] = [
++        ("ITEM_SHOES_INFO_LIST", "boots", "ITEM_SHOES_INFO", "ITEM_SHOES_INFO_REGULAR_UNIQUE_BASE"),
++        ("ITEM_MISANGA_INFO_LIST", "bracelet", "ITEM_MISANGA_INFO", "ITEM_MISANGA_INFO_REGULAR_UNIQUE_BASE"),
++        ("ITEM_ACCESSORY_INFO_LIST", "pendant", "ITEM_ACCESSORY_INFO", "ITEM_ACCESSORY_INFO_REGULAR_UNIQUE_BASE"),
++        ("ITEM_SPECIAL_INFO_LIST", "special", "ITEM_SPECIAL_INFO", "ITEM_SPECIAL_INFO_REGULAR_UNIQUE_BASE"),
++    ];
++
++    pub fn from_row(row: &Row, slot: &'static str) -> Self {
++        Equipment {
++            item_id: parse_int_value(&row.values[0][0]),
++            slot,
++            string_id: parse_string_value(&row.values[11][0]),
++            name_id: parse_int_value(&row.values[2][0]),
++            description_id: parse_int_value(&row.values[3][0]),
++            stats: [0; Equipment::STATS],
++        }
++    }
++
++    /// Stat order matches the character tables: kick, control, technique,
++    /// pressure, physical, agility, intelligence.
++    pub fn read_stats(&mut self, row: &Row) {
++        for (i, stat) in self.stats.iter_mut().enumerate() {
++            if let Some(value) = row.values.get(i) {
++                *stat = parse_int_value(&value[0]);
++            }
++        }
++    }
++}
+diff --git a/src/skills/hissatsu.rs b/src/skills/hissatsu.rs
+index f78adde..91157d8 100644
+--- a/src/skills/hissatsu.rs
++++ b/src/skills/hissatsu.rs
+@@ -5,6 +5,7 @@ use crate::common::{Element, parse_byte_value, parse_f32_value, parse_int_value,
+ pub struct Hissatsu {
+     pub(crate) skill_id: i32,
+     pub(crate) name_id: i32,
++    pub(crate) description_id: i32,
+     pub(crate) power: i16,
+     pub(crate) element: Element,
+     pub(crate) category: Category,
+@@ -26,6 +27,7 @@ impl From<&Row> for Hissatsu {
+         Hissatsu {
+             skill_id: parse_uint_value(&row.values[0][0]).cast_signed(),
+             name_id: parse_uint_value(&row.values[6][0]).cast_signed(),
++            description_id: parse_uint_value(&row.values[7][0]).cast_signed(),
+             power: parse_short_value(&row.values[10][0]),
+             element: (parse_byte_value(&row.values[12][0]) as i32).into(),
+             category: Category::from(parse_byte_value(&row.values[14][0])),
+@@ -33,7 +35,7 @@ impl From<&Row> for Hissatsu {
+             is_block,
+             is_longshot,
+             tp_consumption: parse_byte_value(&row.values[17][0]),
+-            cooldown: parse_f32_value(&row.values[19][0]),
++            cooldown: parse_f32_value(&row.values[18][0]),
+         }
+     }
+ }
+diff --git a/src/skills/passive.rs b/src/skills/passive.rs
+new file mode 100644
+index 0000000..e3eba48
+--- /dev/null
++++ b/src/skills/passive.rs
+@@ -0,0 +1,95 @@
++﻿use ievr_cfg_bin_editor_core::Row;
++
++use crate::common::{parse_int_value, parse_number_value, parse_string_value};
++
++/// A row of PASSIVE_SKILL_INFO_LIST, in passive_skill_config.
++/// Since build 6.00.23.00 the passives no longer live in m_skillInfoList,
++/// which only holds categories 1 to 4 (shoot, dribble, defense, goalkeeper).
++pub struct Passive {
++    pub(crate) passive_id: i32,
++    pub(crate) name_id: i32,
++    pub(crate) link_id_1: i32,
++    pub(crate) link_id_2: i32,
++    pub(crate) category: i32,
++    pub(crate) rank_type: i32,
++    pub(crate) string_id: String,
++    /// Offset into PASSIVE_SKILL_EFFECT_LIST, from the REF_EFFECT sub row
++    pub(crate) effect_index: i32,
++    pub(crate) effect_count: i32,
++    /// The magnitude the <VALUE> placeholder in the name stands for
++    pub(crate) value: Option<f32>,
++    /// Icon the game shows for this passive, resolved through
++    /// PASSIVE_SKILL_BUFF_ICON_LIST. Its own numbering, not a file name.
++    pub(crate) buff_icon: Option<i32>,
++}
++
++impl Passive {
++    pub const COLUMNS: usize = 7;
++
++    /// Name of the row holding a passive itself
++    pub const ROW: &'static str = "PASSIVE_SKILL_INFO";
++    /// Name of the sub row pointing into PASSIVE_SKILL_EFFECT_LIST
++    pub const EFFECT_REF_ROW: &'static str = "PASSIVE_SKILL_INFO_REF_EFFECT";
++    /// Name of the sub row pointing into PASSIVE_SKILL_BUFF_ICON_LIST
++    pub const ICON_REF_ROW: &'static str = "PASSIVE_SKILL_INFO_REF_BUFF_ICON";
++}
++
++impl From<&Row> for Passive {
++    fn from(row: &Row) -> Self {
++        Passive {
++            passive_id: parse_int_value(&row.values[0][0]),
++            name_id: parse_int_value(&row.values[1][0]),
++            link_id_1: parse_int_value(&row.values[2][0]),
++            link_id_2: parse_int_value(&row.values[3][0]),
++            category: parse_int_value(&row.values[4][0]),
++            rank_type: parse_int_value(&row.values[5][0]),
++            string_id: parse_string_value(&row.values[6][0]),
++            buff_icon: None,
++            effect_index: -1,
++            effect_count: 0,
++            value: None,
++        }
++    }
++}
++
++/// One rarity step of a passive family, from m_passiveSkillRarityTableList
++/// in passive_skill_rarity_table_config. Each row holds up to
++/// [`PassiveTier::SLOTS`] ids, ordered from the base passive upwards, and is
++/// zero padded.
++pub struct PassiveTier {
++    pub(crate) family_index: i32,
++    pub(crate) tier: i32,
++    pub(crate) passive_id: i32,
++}
++
++impl PassiveTier {
++    pub const SLOTS: usize = 6;
++}
++
++/// A row of PASSIVE_SKILL_EFFECT_LIST. The effect ids do not join onto
++/// PASSIVE_SKILL_INFO_LIST, so the values are exposed as-is.
++pub struct PassiveEffect {
++    pub(crate) effect_id: i32,
++    pub(crate) value: f32,
++    pub(crate) params: [i32; 7],
++}
++
++impl PassiveEffect {
++    pub const COLUMNS: usize = 9;
++}
++
++impl From<&Row> for PassiveEffect {
++    fn from(row: &Row) -> Self {
++        let mut params = [0i32; 7];
++        for (i, param) in params.iter_mut().enumerate() {
++            *param = parse_int_value(&row.values[i + 2][0]);
++        }
++
++        PassiveEffect {
++            effect_id: parse_int_value(&row.values[0][0]),
++            value: parse_number_value(&row.values[1][0]),
++            params,
++        }
++    }
++}
++
+diff --git a/src/skills/tactic.rs b/src/skills/tactic.rs
+new file mode 100644
+index 0000000..5a5b82c
+--- /dev/null
++++ b/src/skills/tactic.rs
+@@ -0,0 +1,60 @@
++﻿use ievr_cfg_bin_editor_core::Row;
++
++use crate::common::{parse_int_value, parse_number_value, parse_string_value};
++
++/// A special tactic, from SPECIAL_TACTICS_INFO_LIST. Names and descriptions
++/// live in item_text rather than skill_text: the game files these as items.
++pub struct Tactic {
++    pub(crate) tactic_id: i32,
++    pub(crate) string_id: String,
++    pub(crate) name_id: i32,
++    pub(crate) description_id: i32,
++    pub(crate) tp_cost: f32,
++    pub(crate) duration: f32,
++}
++
++impl Tactic {
++    pub const COLUMNS: usize = 17;
++    pub const ROW: &'static str = "SPECIAL_TACTICS_INFO";
++}
++
++impl From<&Row> for Tactic {
++    fn from(row: &Row) -> Self {
++        Tactic {
++            tactic_id: parse_int_value(&row.values[0][0]),
++            string_id: parse_string_value(&row.values[1][0]),
++            name_id: parse_int_value(&row.values[2][0]),
++            description_id: parse_int_value(&row.values[3][0]),
++            tp_cost: parse_number_value(&row.values[4][0]),
++            duration: parse_number_value(&row.values[5][0]),
++        }
++    }
++}
++
++/// A synergy, from ITEM_SYNERGY_FLAG_INFO_LIST in item_config. Column 16 is the
++/// id used by synergy_flag_config, which is the one worth exposing.
++pub struct Synergy {
++    pub(crate) synergy_id: i32,
++    pub(crate) item_id: i32,
++    pub(crate) string_id: String,
++    pub(crate) name_id: i32,
++    pub(crate) description_id: i32,
++}
++
++impl Synergy {
++    pub const COLUMNS: usize = 17;
++    pub const ROW: &'static str = "ITEM_SYNERGY_FLAG_INFO";
++}
++
++impl From<&Row> for Synergy {
++    fn from(row: &Row) -> Self {
++        Synergy {
++            synergy_id: parse_int_value(&row.values[16][0]),
++            item_id: parse_int_value(&row.values[0][0]),
++            string_id: parse_string_value(&row.values[11][0]),
++            name_id: parse_int_value(&row.values[2][0]),
++            description_id: parse_int_value(&row.values[3][0]),
++        }
++    }
++}
++
+diff --git a/src/text.rs b/src/text.rs
+index e9b3d3f..6386da4 100644
+--- a/src/text.rs
++++ b/src/text.rs
+@@ -1,15 +1,36 @@
+-use std::{collections::HashMap, path::Path, sync::LazyLock};
++﻿use std::{collections::HashMap, path::{Path, PathBuf}, sync::LazyLock};
+ 
+ use crossbeam::channel::{Receiver, never};
+ use rayon::prelude::*;
++use regex::Regex;
+ use rusqlite::Connection;
+ 
++mod name_tags;
+ mod text_database;
+ 
++use name_tags::NameTags;
+ use text_database::TextDatabase;
+ 
+ use crate::common::parse_gamefile;
+ 
++/// The placeholder tables live in gamedata, not text, and are the same for every language.
++const NAME_TAG_FILES: [(&str, &str); 3] = [
++    ("data/common/gamedata/character/", r"^chara_name_tag_[\d.]+\.cfg\.bin$"),
++    ("data/common/gamedata/map/", r"^map_name_tag_[\d.]+\.cfg\.bin$"),
++    ("data/common/gamedata/character/", r"^chara_base_[\d.]+\.cfg\.bin$"),
++];
++
++fn find_file(directory: &Path, pattern: &str) -> PathBuf {
++    let regex = Regex::new(pattern).unwrap();
++    std::fs::read_dir(directory)
++        .unwrap_or_else(|e| panic!("cannot read {}: {e}", directory.display()))
++        .filter_map(Result::ok)
++        .map(|entry| entry.file_name().to_string_lossy().into_owned())
++        .find(|name| regex.is_match(name))
++        .map(|name| directory.join(name))
++        .unwrap_or_else(|| panic!("no file matching {pattern} in {}", directory.display()))
++}
++
+ pub const TEXT_LANGUAGES: [&str; 9] = [
+     "de", "en", "es", "fr", "it", "ja", "pt", "zh_hans", "zh_hant",
+ ];
+@@ -30,6 +51,11 @@ pub const TEXT_REQUIRED_FILES: LazyLock<
+         language_map.insert("chara_text", "^chara_text.cfg.bin$");
+         language_map.insert("chara_text_roma", "^chara_text_roma.cfg.bin$");
+         language_map.insert("skill_text", "^skill_text.cfg.bin$");
++        language_map.insert("team_text", "^team_text.cfg.bin$");
++        language_map.insert("item_text", "^item_text.cfg.bin$");
++        language_map.insert("map_text", "^map_text.cfg.bin$");
++        language_map.insert("game_title", "^soccer_game_title.cfg.bin$");
++        language_map.insert("universe_text", "^players_universe_text.cfg.bin$");
+     }
+     map
+ });
+@@ -39,7 +65,7 @@ pub fn populate_text_data(
+     text_database_connections: HashMap<&'static str, Connection>,
+     requested_files: HashMap<&'static str, HashMap<&'static str, String>>,
+     char_name_req_rx: Receiver<(i32, i32)>,
+-    skill_name_req_rx: Receiver<i32>
++    skill_name_req_rx: Receiver<(i32, i32)>
+ ) {
+     assert!(text_database_connections.len() == TEXT_LANGUAGES.len());
+ 
+@@ -48,6 +74,12 @@ pub fn populate_text_data(
+ 
+     let root_path = extraction_path.join(TEXT_ROOT_PATH);
+ 
++    let tag_files: Vec<_> = NAME_TAG_FILES
++        .iter()
++        .map(|(dir, pattern)| parse_gamefile(&find_file(&extraction_path.join(dir), pattern)).unwrap())
++        .collect();
++    let name_tags = NameTags::load(&tag_files[0], &tag_files[1], &tag_files[2]);
++
+     let mut databases: Vec<TextDatabase> = text_database_connections
+         .into_par_iter()
+         .map(|(language, conn)| {
+@@ -83,6 +115,38 @@ pub fn populate_text_data(
+                         .join(&requested_files[language]["skill_text"]),
+                 )
+                 .unwrap(),
++                parse_gamefile(
++                    &root_path
++                        .join(language)
++                        .join(&requested_files[language]["team_text"]),
++                )
++                .unwrap(),
++                parse_gamefile(
++                    &root_path
++                        .join(language)
++                        .join(&requested_files[language]["item_text"]),
++                )
++                .unwrap(),
++                parse_gamefile(
++                    &root_path
++                        .join(language)
++                        .join(&requested_files[language]["map_text"]),
++                )
++                .unwrap(),
++                parse_gamefile(
++                    &root_path
++                        .join(language)
++                        .join(&requested_files[language]["game_title"]),
++                )
++                .unwrap(),
++                parse_gamefile(
++                    &root_path
++                        .join(language)
++                        .join(&requested_files[language]["universe_text"]),
++                )
++                .unwrap(),
++                &name_tags,
++                language,
+             )
+         })
+         .collect();
+@@ -161,3 +225,6 @@ pub fn populate_text_data(
+         databases[0].get_missing_names()
+     );
+ }
++
++
++
+diff --git a/src/text/name_tags.rs b/src/text/name_tags.rs
+new file mode 100644
+index 0000000..45ac84b
+--- /dev/null
++++ b/src/text/name_tags.rs
+@@ -0,0 +1,273 @@
++//! Resolving the `<PREFIX:KEY>` placeholders that non-Japanese text still carries.
++//!
++//! Japanese and both Chinese locales ship the literal text; every other locale leaves a
++//! placeholder for the game to fill in at runtime. Two config tables do the filling, both
++//! keyed by the CRC32 of the ASCII key:
++//!
++//! - `gamedata/character/chara_name_tag_*.cfg.bin` → `m_charaNameTagConfigList`,
++//!   `(crc, chara_base row id, _)`. `CRC32("ENDO")` lands on Mark Evans' row.
++//! - `gamedata/map/map_name_tag_*.cfg.bin` → `m_mapNameTagConfigList`, `(crc, map_text id)`.
++//!   This is what `MNT` — map name tag — uses, for places and clubs.
++//!
++//! The prefix picks which `chara_text` sub entry to read. Measured against the Japanese and
++//! Simplified Chinese text, which are already resolved, over ~700 placeholders: the nine
++//! character prefixes fall into three groups of three. Within a group they differ only in
++//! Japanese ruby typography — `FFC` groups the reading over the whole name where `FUL`
++//! leaves it split — which is invisible in a locale that has no ruby.
++
++use std::collections::HashMap;
++
++use ievr_cfg_bin_editor_core::Database;
++
++use crate::common::{parse_int_value, parse_uint_value};
++
++/// Column indices, build 6.00.23.00.
++///
++/// `chara_name_tag` rows are `(crc, chara_base row id, unused)`: column 1 holds row ids that
++/// match `chara_base` column 0 — `CRC32("ENDO")` = 2247885273 resolves to -1717452464, which
++/// is the `c01000010` row. `map_name_tag` rows are `(crc, text id)`: column 1 resolves in
++/// `map_text`, checked on `NAGUMOHARA` → South Cirrus / Nagumohara / 南雲原.
++const TAG_KEY: usize = 0;
++const TAG_TARGET: usize = 1;
++/// `chara_base` column 3 is the name id, the key into `chara_text`; 4 is the short name the
++/// pitch shows, 5 the same string uppercased for the shirt.
++const CHARA_BASE_ID: usize = 0;
++const CHARA_BASE_NAME_ID: usize = 3;
++const CHARA_BASE_SHORT_ID: usize = 4;
++const CHARA_BASE_UPPER_ID: usize = 5;
++
++/// Which `chara_text` sub entry a prefix reads. Sub 0 is the full name, 11 the family name,
++/// 12 the given name.
++fn sub_entry(prefix: &str) -> Option<i32> {
++    match prefix {
++        "FUL" | "FFC" | "LFC" => Some(0),
++        "LST" | "FLC" | "FLA" => Some(11),
++        "FST" | "FFS" | "LAF" => Some(12),
++        _ => None,
++    }
++}
++
++/// Locale grammar that the translators expressed as placeholders. These are registered in
++/// `chara_name_tag` with a target of 0 — they name no character. Only French and Italian use
++/// any; German, English, Spanish and Portuguese use none.
++enum Particle {
++    /// French picked the form by hand, against the Japanese name it was translating, so the
++    /// choice is already baked into which symbol was used.
++    Fixed(&'static str),
++    /// Italian names the alternatives in the symbol itself — `ad_a`, `il_l'` — and lets the
++    /// following word decide.
++    Elided {
++        before_vowel: &'static str,
++        otherwise: &'static str,
++    },
++}
++
++enum Replacement {
++    Character { name_id: i32 },
++    Place { text_id: i32 },
++    Grammar(Particle),
++    /// A few symbols are registered with no usable target: `TANAKA` points at 1074139552,
++    /// which appears in no text file in any language, and `SHIROYAMA` / `YAMADA` carry a
++    /// target of 0 like the particles do. Every symbol key is the uppercase romaji of the
++    /// name it stands for — proven on ENDO, GOENJI, TSURUGI, which all come from `chara_base`
++    /// column 5 read through `chara_text_roma` — and the Japanese confirms the reading
++    /// (田中, 白山, 山田), so title-casing the key is a derivation, not an invention.
++    Literal(&'static str),
++}
++
++pub struct TagError {
++    pub key: String,
++    pub line: String,
++}
++
++pub struct NameTags {
++    symbols: HashMap<u32, Replacement>,
++    /// Every `chara_text` entry a character points at: the full name in column 3, the short
++    /// name the pitch shows in column 4, its uppercase twin in column 5. Downstream needs all
++    /// three resolved, and re-reading the raw config to get them is how placeholders came back.
++    referenced_names: Vec<i32>,
++}
++
++fn crc32(bytes: &[u8]) -> u32 {
++    let mut crc = 0xFFFF_FFFFu32;
++    for &byte in bytes {
++        crc ^= byte as u32;
++        for _ in 0..8 {
++            crc = if crc & 1 != 0 {
++                0xEDB8_8320 ^ (crc >> 1)
++            } else {
++                crc >> 1
++            };
++        }
++    }
++    !crc
++}
++
++impl NameTags {
++    pub fn load(chara_name_tag: &Database, map_name_tag: &Database, chara_base: &Database) -> Self {
++        // chara_base row id -> the name id the text tables use
++        let mut name_id_of_row = HashMap::new();
++        let mut referenced_names = Vec::new();
++        let chara_base_table = chara_base.table("CHARA_BASE_INFO_LIST").unwrap();
++        for row in chara_base_table.rows() {
++            if row.values.len() < 34 {
++                continue;
++            }
++            let id = parse_int_value(&row.values[CHARA_BASE_ID][0]);
++            let name_id = parse_int_value(&row.values[CHARA_BASE_NAME_ID][0]);
++            name_id_of_row.entry(id).or_insert(name_id);
++
++            for column in [CHARA_BASE_NAME_ID, CHARA_BASE_SHORT_ID, CHARA_BASE_UPPER_ID] {
++                let value = parse_int_value(&row.values[column][0]);
++                if value != 0 {
++                    referenced_names.push(value);
++                }
++            }
++        }
++        referenced_names.sort_unstable();
++        referenced_names.dedup();
++
++        let mut symbols = HashMap::new();
++
++        let chara_table = chara_name_tag.table("m_charaNameTagConfigList").unwrap();
++        for row in chara_table.rows() {
++            if row.values.len() < 3 {
++                continue;
++            }
++            let key = parse_uint_value(&row.values[TAG_KEY][0]);
++            let target = parse_uint_value(&row.values[TAG_TARGET][0]).cast_signed();
++
++            // A target of 0 means the symbol stands for grammar, not a person
++            if target == 0 {
++                continue;
++            }
++            if let Some(&name_id) = name_id_of_row.get(&target) {
++                symbols.insert(key, Replacement::Character { name_id });
++            }
++        }
++
++        let map_table = map_name_tag.table("m_mapNameTagConfigList").unwrap();
++        for row in map_table.rows() {
++            if row.values.len() < 2 {
++                continue;
++            }
++            let key = parse_uint_value(&row.values[TAG_KEY][0]);
++            let text_id = parse_uint_value(&row.values[TAG_TARGET][0]).cast_signed();
++            symbols.insert(key, Replacement::Place { text_id });
++        }
++
++        for (key, particle) in [
++            ("DE1", Particle::Fixed("d'")),
++            ("DE2", Particle::Fixed("de ")),
++            ("QUE1", Particle::Fixed("qu'")),
++            ("QUE2", Particle::Fixed("que ")),
++            (
++                "ad_a",
++                Particle::Elided { before_vowel: "ad ", otherwise: "a " },
++            ),
++            (
++                "il_l'",
++                Particle::Elided { before_vowel: "l'", otherwise: "il " },
++            ),
++        ] {
++            symbols.insert(crc32(key.as_bytes()), Replacement::Grammar(particle));
++        }
++
++        for (key, name) in [
++            ("TANAKA", "Tanaka"),
++            ("SHIROYAMA", "Shiroyama"),
++            ("YAMADA", "Yamada"),
++        ] {
++            symbols.insert(crc32(key.as_bytes()), Replacement::Literal(name));
++        }
++
++        NameTags { symbols, referenced_names }
++    }
++
++    pub fn referenced_names(&self) -> &[i32] {
++        &self.referenced_names
++    }
++
++    /// Replace every placeholder in `line`. Returns the offending key rather than dropping it,
++    /// because a silent fallback is what let this go unnoticed in the first place.
++    pub fn resolve(
++        &self,
++        line: &str,
++        names: &HashMap<(i32, i32), String>,
++        places: &HashMap<i32, String>,
++    ) -> Result<String, TagError> {
++        if !line.contains('<') {
++            return Ok(line.to_string());
++        }
++
++        // Elisions need to see what follows, so build pieces first and join afterwards
++        enum Piece<'a> {
++            Text(String),
++            Elision { before_vowel: &'a str, otherwise: &'a str },
++        }
++        let mut pieces: Vec<Piece> = Vec::new();
++        let mut rest = line;
++
++        while let Some(open) = rest.find('<') {
++            let Some(close_offset) = rest[open..].find('>') else { break };
++            let close = open + close_offset;
++            let inside = &rest[open + 1..close];
++
++            let Some((prefix, key)) = inside.split_once(':') else {
++                // Not one of ours — markup like [kanji/kana] never uses angle brackets
++                pieces.push(Piece::Text(rest[..=close].to_string()));
++                rest = &rest[close + 1..];
++                continue;
++            };
++
++            pieces.push(Piece::Text(rest[..open].to_string()));
++
++            let fail = || TagError { key: inside.to_string(), line: line.to_string() };
++            let replacement = self.symbols.get(&crc32(key.as_bytes())).ok_or_else(fail)?;
++
++            match replacement {
++                Replacement::Grammar(Particle::Fixed(text)) => {
++                    pieces.push(Piece::Text((*text).to_string()))
++                }
++                Replacement::Grammar(Particle::Elided { before_vowel, otherwise }) => {
++                    pieces.push(Piece::Elision { before_vowel, otherwise })
++                }
++                Replacement::Literal(text) => pieces.push(Piece::Text((*text).to_string())),
++                Replacement::Place { text_id } => {
++                    let name = places.get(text_id).ok_or_else(fail)?;
++                    pieces.push(Piece::Text(name.clone()))
++                }
++                Replacement::Character { name_id } => {
++                    let sub = sub_entry(prefix).ok_or_else(fail)?;
++                    let name = names.get(&(*name_id, sub)).ok_or_else(fail)?;
++                    pieces.push(Piece::Text(name.clone()))
++                }
++            }
++
++            rest = &rest[close + 1..];
++        }
++        pieces.push(Piece::Text(rest.to_string()));
++
++        let mut out = String::with_capacity(line.len());
++        for index in 0..pieces.len() {
++            match &pieces[index] {
++                Piece::Text(text) => out.push_str(text),
++                Piece::Elision { before_vowel, otherwise } => {
++                    let next = pieces[index + 1..].iter().find_map(|p| match p {
++                        Piece::Text(t) if !t.is_empty() => t.chars().next(),
++                        _ => None,
++                    });
++                    let vowel = next.is_some_and(|c| {
++                        matches!(
++                            c.to_ascii_uppercase(),
++                            'A' | 'E' | 'I' | 'O' | 'U' | 'H'
++                        )
++                    });
++                    out.push_str(if vowel { before_vowel } else { otherwise });
++                }
++            }
++        }
++
++        Ok(out)
++    }
++}
+diff --git a/src/text/text_database.rs b/src/text/text_database.rs
+index 44e77ae..ae052b6 100644
+--- a/src/text/text_database.rs
++++ b/src/text/text_database.rs
+@@ -1,16 +1,29 @@
+-use std::collections::HashMap;
++﻿use std::collections::HashMap;
+ 
+ use ievr_cfg_bin_editor_core::Database;
+ use rusqlite::{Connection, params};
+ 
++use super::name_tags::NameTags;
+ use crate::common::{parse_int_value, parse_string_value};
+ 
++/// A placeholder we cannot fill is a bug in the extraction, not a cosmetic flaw, and the
++/// caller swallows thread panics — so say what broke and stop the process.
++fn abort_on_unresolved(language: &str, field: &str, key: &str, line: &str) -> ! {
++    eprintln!(
++        "[TEXT/{language}] unresolved placeholder <{key}> in {field}\n  line: {line}\n\
++         Every key must resolve through chara_name_tag or map_name_tag; refusing to write \
++         partial text."
++    );
++    std::process::exit(1)
++}
++
+ pub struct TextDatabase {
+     conn: Connection,
+     chara_names: HashMap<i32, String>,
+     chara_roma_names: HashMap<i32, String>,
+     chara_descriptions: HashMap<i32, String>,
+     skill_names: HashMap<i32, String>,
++    skill_descriptions: HashMap<i32, String>,
+ 
+     missing_character_names: u32,
+ }
+@@ -23,6 +36,13 @@ impl TextDatabase {
+         chara_description: Database,
+         chara_add_info: Database,
+         skill_text: Database,
++        team_text: Database,
++        item_text: Database,
++        map_text: Database,
++        game_title: Database,
++        universe_text: Database,
++        name_tags: &NameTags,
++        language: &str,
+     ) -> TextDatabase {
+         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+         conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+@@ -37,12 +57,20 @@ impl TextDatabase {
+         rows_iter.next_back(); // We remove the END row
+ 
+         let mut chara_names = HashMap::with_capacity(rows_iter.len());
++        // Sub entry 0 is the full name, 11 the family name, 12 the given name. The name tag
++        // prefixes read all three, so keep them rather than only the main one.
++        let mut name_parts: HashMap<(i32, i32), String> = HashMap::new();
+ 
+         for row in rows_iter {
+             let index = parse_int_value(&row.values[0][0]);
++            let sub = parse_int_value(&row.values[1][0]);
+             let string = parse_string_value(&row.values[5][0]);
+ 
+-            if parse_int_value(&row.values[1][0]) == 0 {
++            if !string.is_empty() {
++                name_parts.insert((index, sub), string.clone());
++            }
++
++            if sub == 0 {
+                 // This value is different from 0 when texts are alternatives of the main one
+                 if chara_names.insert(index, string).is_some() {
+                     println!("Text index {index} in double");
+@@ -50,6 +78,28 @@ impl TextDatabase {
+             }
+         }
+ 
++        // Places and clubs, the targets of the MNT prefix
++        let mut places = HashMap::new();
++        if let Some(map_table) = map_text.table("NOUN_INFO") {
++            for row in map_table.rows() {
++                if row.values.len() < 15 || parse_int_value(&row.values[1][0]) != 0 {
++                    continue;
++                }
++                let index = parse_int_value(&row.values[0][0]);
++                let name = parse_string_value(&row.values[5][0]);
++                if !name.is_empty() {
++                    places.insert(index, name);
++                }
++            }
++        }
++
++        let resolve = |field: &str, text: &str| -> String {
++            match name_tags.resolve(text, &name_parts, &places) {
++                Ok(resolved) => resolved,
++                Err(e) => abort_on_unresolved(language, field, &e.key, &e.line),
++            }
++        };
++
+         // Computing the character roma hash table
+         let chara_roma_table = chara_text_roma.table("NOUN_INFO").unwrap();
+         let mut rows_iter = chara_roma_table.rows().into_iter();
+@@ -58,11 +108,20 @@ impl TextDatabase {
+         rows_iter.next_back(); // We remove the END row
+ 
+         let mut chara_roma_names = HashMap::with_capacity(rows_iter.len());
++        // The roma table has its own placeholders, and they must be filled from the roma
++        // names — <FUL:UMIBOZU> is Kraken in English but Umibozu here.
++        let mut roma_parts: HashMap<(i32, i32), String> = HashMap::new();
++
+         for row in rows_iter {
+             let index = parse_int_value(&row.values[0][0]);
++            let sub = parse_int_value(&row.values[1][0]);
+             let string = parse_string_value(&row.values[5][0]);
+ 
+-            if parse_int_value(&row.values[1][0]) == 0 {
++            if !string.is_empty() {
++                roma_parts.insert((index, sub), string.clone());
++            }
++
++            if sub == 0 {
+                 // This value is different from 0 when texts are alternatives of the main one
+                 if chara_roma_names.insert(index, string).is_some() {
+                     println!("Text index {index} in double");
+@@ -80,16 +139,87 @@ impl TextDatabase {
+         let mut chara_descriptions = HashMap::with_capacity(rows_iter.len());
+         for row in rows_iter {
+             let index = parse_int_value(&row.values[0][0]);
+-            let string = parse_string_value(&row.values[2][0]);
++            let string = resolve("character description", &parse_string_value(&row.values[2][0]));
+ 
+             if chara_descriptions.insert(index, string).is_some() {
+                 println!("Character description {index} in double");
+             }
+         }
+ 
++        // Names carry placeholders too, on the handful of entries that name someone else
++        for name in chara_names.values_mut() {
++            *name = resolve("character name", name);
++        }
++        for name in chara_roma_names.values_mut() {
++            *name = match name_tags.resolve(name, &roma_parts, &places) {
++                Ok(resolved) => resolved,
++                Err(e) => abort_on_unresolved(language, "original name", &e.key, &e.line),
++            };
++        }
++
++        // Every string the bundles need, resolved once here rather than re-read raw from the
++        // config files downstream — which is how placeholders leaked back in.
++        {
++            let tx = conn.transaction().unwrap();
++            {
++                let mut parts = tx
++                    .prepare_cached(
++                        "INSERT INTO character_name_parts (id, part, text) VALUES (?1, ?2, ?3)
++                         ON CONFLICT(id, part) DO NOTHING",
++                    )
++                    .unwrap();
++                // Part 0 is the entry as written — the pitch name and its uppercase twin live
++                // in entries of their own, so store every name a character points at. Parts
++                // 11 and 12 are the family / given split, and only the main cast has them.
++                for name_id in name_tags.referenced_names() {
++                    for sub in [0, 11, 12] {
++                        let Some(text) = name_parts.get(&(*name_id, sub)) else { continue };
++                        parts
++                            .execute(params![name_id, sub, resolve("name part", text)])
++                            .unwrap();
++                    }
++                }
++
++                let mut places_stmt = tx
++                    .prepare_cached(
++                        "INSERT INTO place_names (id, name) VALUES (?1, ?2)
++                         ON CONFLICT(id) DO NOTHING",
++                    )
++                    .unwrap();
++                for (id, name) in &places {
++                    places_stmt
++                        .execute(params![id, resolve("place name", name)])
++                        .unwrap();
++                }
++
++                // Match titles and Player Universe star signs, the targets of found_in
++                let mut loc = tx
++                    .prepare_cached(
++                        "INSERT INTO location_names (id, name) VALUES (?1, ?2)
++                         ON CONFLICT(id) DO NOTHING",
++                    )
++                    .unwrap();
++                for (database, table) in [(&game_title, "TEXT_INFO"), (&universe_text, "NOUN_INFO")] {
++                    let Some(source) = database.table(table) else { continue };
++                    for row in source.rows() {
++                        if row.values.len() < 3 || parse_int_value(&row.values[1][0]) != 0 {
++                            continue;
++                        }
++                        let index = parse_int_value(&row.values[0][0]);
++                        let column = if row.values.len() >= 15 { 5 } else { 2 };
++                        let text = parse_string_value(&row.values[column][0]);
++                        if !text.is_empty() {
++                            loc.execute(params![index, resolve("location name", &text)]).unwrap();
++                        }
++                    }
++                }
++            }
++            tx.commit().unwrap();
++        }
++
+         // Inserting the series' names into the database
+         let series_table = chara_add_info.table("NOUN_INFO").unwrap();
+-        Self::insert_series(&mut conn, series_table);
++        Self::insert_series(&mut conn, series_table, &resolve);
+ 
+         // We get the skill names
+         let skill_name_table = skill_text.table("NOUN_INFO").unwrap();
+@@ -98,7 +228,7 @@ impl TextDatabase {
+         for row in skill_name_table.rows() {
+             if row.values.len() == 15 && parse_int_value(&row.values[1][0]) == 0 {
+                 let index = parse_int_value(&row.values[0][0]);
+-                let string = parse_string_value(&row.values[5][0]);
++                let string = resolve("skill name", &parse_string_value(&row.values[5][0]));
+ 
+                 if skill_names.insert(index, string).is_some() {
+                     eprintln!("Skill name {index} in double")
+@@ -106,12 +236,80 @@ impl TextDatabase {
+             }
+         }
+ 
++        // Club and item names are few and never requested one by one, so they
++        // all go in at once. Tactics and synergies take their names from
++        // item_text, which is why it is loaded here too.
++        for (table_name, database) in [("team_names", &team_text), ("item_names", &item_text)] {
++            let Some(noun_table) = database.table("NOUN_INFO") else { continue };
++
++            let tx = conn.transaction().unwrap();
++            {
++                let mut stmt = tx
++                    .prepare_cached(&format!(
++                        "INSERT INTO {table_name} (id, name) VALUES (?1, ?2)
++                         ON CONFLICT(id) DO NOTHING"
++                    ))
++                    .unwrap();
++
++                for row in noun_table.rows() {
++                    if row.values.len() < 15 || parse_int_value(&row.values[1][0]) != 0 {
++                        continue;
++                    }
++                    let index = parse_int_value(&row.values[0][0]);
++                    let name = parse_string_value(&row.values[5][0]);
++                    if !name.is_empty() {
++                        stmt.execute(params![index, resolve(table_name, &name)]).unwrap();
++                    }
++                }
++            }
++            tx.commit().unwrap();
++        }
++
++        // Tactic and synergy descriptions live in item_text's TEXT_INFO
++        if let Some(desc_table) = item_text.table("TEXT_INFO") {
++            let tx = conn.transaction().unwrap();
++            {
++                let mut stmt = tx
++                    .prepare_cached(
++                        "INSERT INTO item_descriptions (id, description) VALUES (?1, ?2)
++                         ON CONFLICT(id) DO NOTHING",
++                    )
++                    .unwrap();
++
++                for row in desc_table.rows() {
++                    if row.values.len() != 3 {
++                        continue;
++                    }
++                    let index = parse_int_value(&row.values[0][0]);
++                    let text = parse_string_value(&row.values[2][0]);
++                    if !text.is_empty() {
++                        stmt.execute(params![index, resolve("item description", &text)]).unwrap();
++                    }
++                }
++            }
++            tx.commit().unwrap();
++        }
++
++        // We get the skill descriptions, which are keyed by a different id than the names
++        let skill_desc_table = skill_text.table("TEXT_INFO").unwrap();
++
++        let mut skill_descriptions = HashMap::with_capacity(skill_desc_table.rows().len());
++        for row in skill_desc_table.rows() {
++            if row.values.len() == 3 {
++                let index = parse_int_value(&row.values[0][0]);
++                let string = resolve("skill description", &parse_string_value(&row.values[2][0]));
++
++                skill_descriptions.insert(index, string);
++            }
++        }
++
+         TextDatabase {
+             conn,
+             chara_names,
+             chara_roma_names,
+             chara_descriptions,
+             skill_names,
++            skill_descriptions,
+             missing_character_names: 0,
+         }
+     }
+@@ -188,21 +386,23 @@ impl TextDatabase {
+     }
+ 
+     #[allow(dead_code)]
+-    pub fn write_skill(&mut self, index_batch: &Vec<i32>) {
++    pub fn write_skill(&mut self, index_batch: &Vec<(i32, i32)>) {
+         let tx = self.conn
+             .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+             .unwrap();
+ 
+         {
+             let mut stmt = tx.prepare_cached(
+-                "INSERT INTO skill_names (id, name) 
+-            VALUES (?1, ?2)
++                "INSERT INTO skill_names (id, name, description)
++            VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO NOTHING"
+             ).unwrap();
+ 
+-            for skill_index in index_batch {
++            for (skill_index, description_index) in index_batch {
+                 if let Some(name) = self.skill_names.get(skill_index) {
+-                    stmt.execute(params![skill_index, name]).unwrap();
++                    let description = self.skill_descriptions.get(description_index);
++
++                    stmt.execute(params![skill_index, name, description]).unwrap();
+                 }
+             }
+         }
+@@ -251,6 +451,62 @@ impl TextDatabase {
+         )
+         .unwrap();
+ 
++        conn.execute(
++            "CREATE TABLE item_names (
++                id INTEGER PRIMARY KEY,
++                name TEXT NOT NULL
++            )",
++            (),
++        )
++        .unwrap();
++
++        conn.execute(
++            "CREATE TABLE item_descriptions (
++                id INTEGER PRIMARY KEY,
++                description TEXT NOT NULL
++            )",
++            (),
++        )
++        .unwrap();
++
++        conn.execute(
++            "CREATE TABLE team_names (
++                id INTEGER PRIMARY KEY,
++                name TEXT NOT NULL
++            )",
++            (),
++        )
++        .unwrap();
++
++        conn.execute(
++            "CREATE TABLE character_name_parts (
++                id INTEGER NOT NULL,
++                part INTEGER NOT NULL,
++                text TEXT NOT NULL,
++                PRIMARY KEY (id, part)
++            )",
++            (),
++        )
++        .unwrap();
++
++        conn.execute(
++            "CREATE TABLE place_names (
++                id INTEGER PRIMARY KEY,
++                name TEXT NOT NULL
++            )",
++            (),
++        )
++        .unwrap();
++
++        conn.execute(
++            "CREATE TABLE location_names (
++                id INTEGER PRIMARY KEY,
++                name TEXT NOT NULL
++            )",
++            (),
++        )
++        .unwrap();
++
+         conn.execute(
+             "CREATE TABLE skill_names (
+                 id INTEGER PRIMARY KEY,
+@@ -262,7 +518,11 @@ impl TextDatabase {
+         .unwrap();
+     }
+ 
+-    fn insert_series(conn: &mut Connection, series_table: &ievr_cfg_bin_editor_core::Table) {
++    fn insert_series(
++        conn: &mut Connection,
++        series_table: &ievr_cfg_bin_editor_core::Table,
++        resolve: &dyn Fn(&str, &str) -> String,
++    ) {
+         let tx = conn
+             .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+             .unwrap();
+@@ -282,7 +542,7 @@ impl TextDatabase {
+ 
+             for row in series_iter {
+                 let index = parse_int_value(&row.values[0][0]);
+-                let name = parse_string_value(&row.values[5][0]);
++                let name = resolve("series name", &parse_string_value(&row.values[5][0]));
+ 
+                 stmt.execute(params![index, name]).unwrap();
+             }
+@@ -296,3 +556,5 @@ impl TextDatabase {
+ /// This object must not share connections with other object of
+ /// the same type, otherwise race conditions occurr.
+ unsafe impl Sync for TextDatabase {}
++
++
+-- 
+2.55.0.windows.2
+
