@@ -55,9 +55,9 @@ Hard links rather than copies, since these are multi-GB files on the same volume
 `export_json`. The dataminer wipes its output directory on every run, which is why enrichment has
 to come after and cannot be cached.
 
-**enrich** — eleven PowerShell steps for things the Rust does not emit: learned techniques,
-synergy members, aura types, gender, name parts, nicknames, spirit drops and where to find them,
-position and style legends. Order matters — `spirit_pool` writes the list `add_drop_flag` reads,
+**enrich** — twelve PowerShell steps for things the Rust does not emit: learned techniques,
+synergy members, aura types, passive icons and builds, gender, name parts, nicknames, spirit
+drops and where to find them, position and style legends. Order matters — `spirit_pool` writes the list `add_drop_flag` reads,
 and `add_legend_tail` builds furigana-free variants of fields earlier steps create. It ends by
 counting unresolved `<...>` placeholders and refuses to finish if it finds any.
 
@@ -78,22 +78,33 @@ rarely and cutting them is a judgement call.
   one. Each `.cpk` starts with its own table of contents, XOR-encrypted with a key that is the
   CRC32 of the archive's own file name; decrypt the first few MB of each and the names fall out
   as plain text. This is the trick behind unpacking 200 MB instead of 56.7 GB.
-- **`slice-grid.ps1`** — cuts a `.g4tx` atlas. A `.g4tx` is a small header followed by a DDS at a
-  variable offset, usually BC7.
+- **`cut-rects.ps1`** — cuts an atlas using the sprite table inside its own header. Use this one.
+- **`slice-grid.ps1`** — the older fallback: cuts by detecting transparent gutters, for an atlas
+  whose header table does not parse.
 - **`contact-sheet.ps1`** — renders an atlas with numbered cells, for reading it.
 - **`cri_lib.ps1`** — the CRI block cipher and CRC32, shared by the above.
 
-Two things worth not rediscovering:
+Three things worth not rediscovering:
 
-**Atlases are regular grids. Slice by the transparent gutters, never by connected components** —
-a component pass splits every glyph with a detached dot into pieces.
+**A `.g4tx` carries its own sprite table.** No `.g4tp` descriptor ships, which made the atlases
+look like undocumented grids for a long time — but the header does the job. It is a list of
+sub-rectangles, `x y w h` as `u16`, 24 bytes per record, from `0x94` up to the `DDS ` magic.
+That is authoritative, and it catches what a grid pass cannot: `icon_teambuff` packs eight 48×32
+position badges (`MF` `DF` `GK` … `FW`) into what looks like a single 128×128 cell, and a grid
+slicer silently merges them into three garbled cells.
 
-**Atlas cell order does not encode the game id.** This looked true for tactics and is a
-coincidence: 69 hand-named tactic icons pixel-matched their grid cells at distance 0, but no
-config column predicts a cell for synergies (all 17 columns of `SPECIAL_TACTICS_INFO` tested,
-best 3/81). No `.g4tp` descriptor ships for the icon atlases and the menu Lua is compiled
-bytecode. The way to label an atlas is to pixel-match it against an already-named set, which
-means getting the names from somewhere else first — an in-game screenshot, usually.
+**Sprite order is the packer's insertion order, not row-major.** The rects come out in expanding
+L-shells — (0,0), (1,0), (0,1), (1,1), (2,0), (2,1), (0,2)… — because the sheet grew as sprites
+were added. So neither the grid index nor the sprite index is anything you can guess from the
+picture.
+
+**Neither index is the id the data uses.** Verified on tactics, where the mapping is known for all
+71 icons: the sprite order tracks ascending `wht*` id for the original set but appends
+later-patched tactics at the end, so it is *correlated* with the data and equal to it nowhere.
+All 17 columns of `SPECIAL_TACTICS_INFO` were tested against the cells, best 3/81. The
+data→sprite step lives in the menu code, which ships as compiled Lua. Labelling an atlas still
+means matching it against names obtained elsewhere — an in-game screenshot, or, as for the
+passives below, the text of the entries that use each icon.
 
 ## After a game patch
 
@@ -157,6 +168,30 @@ in French, `ad_a` and `il_l'` in Italian.
 Roma names resolve against roma parts, not localised ones — `<FUL:UMIBOZU>` in `name_original` is
 Umibozu, not Kraken.
 
+### Which icon a passive gets
+
+A passive row carries no icon column, and `PASSIVE_SKILL_INFO_REF_BUFF_ICON` — the one that looks
+like the answer — is used by 108 of 1716 and does not track the stat. The icon the ability list
+shows comes from the passive's **effect**: in `soccer/passive_skill_effect_config`, every effect
+carries `GRAND_TOTAL_INFO_BUFF_ICON_DATA`, an icon id, and 28 of them also carry
+`GRAND_TOTAL_INFO_BUILD_TYPE_ICON_DATA`, which of the six team builds it belongs to. Joining
+passive → effect → icon covers **1630 of 1716**; the rest are 70 passives whose effect has no
+icon and 16 with no effect at all.
+
+The ids are self-labelling, which is what makes this checkable rather than plausible: every
+passive sharing an id names the same stat. All 144 under id 11 say "Castle Wall DF", all 190
+under id 2 say "Shot AT", and so on across the 25 ids in use — so `legend.passive_icon` is read
+off the game's own text, not guessed. The build ids come out in exactly the order `legend.style`
+already uses, confirmed by the passives that name their own build ("For each Charge Rank up with
+Bond Team Build…" → 2).
+
+What is still missing is only the last hop, id → sprite. The atlas is
+`menu/200_icon/08_icon_teambuff/<LG>/icon_teambuff.g4tx` (localised, 45 pictograms plus the 8
+position badges), and the ids are not its sprite indices. Eight are certain anyway because the
+pictogram is unambiguous or is literally the text — `AT`, `DF`, `T`, the intact and the breached
+castle wall, the two money bags, the shooting comet. The rest are graded in
+`_passive_icons.csv` next to the cut sprites.
+
 ## Known limits
 
 - **Character → passive does not exist as a table.** `ability_learning_config` rolls passives from
@@ -164,8 +199,9 @@ Umibozu, not Kraken.
   attributes, not identity: 161 distinct passives out of 1716 across every pool. Each player ships
   five that scale with rarity plus a custom slot at level 50. The most a tool can offer is the
   candidate pool for a style and growth pattern.
-- **Synergy icons are unlabelled** — 41 icons, 37 synergies, no link in any data file. Same for
-  the 49 `passives/` icons.
+- **Synergy icons are unlabelled** — 41 icons, 37 synergies, no link in any data file.
+- **Passive icon ids do not resolve to sprites** — see above. Seventeen of the 25 are still
+  graded guesses.
 - **The enrichment is still PowerShell shelling out to `show_table` and parsing its output.** It
   works and it is checked, but it belongs in Rust. Mechanical to move: every config those steps
   read is one the dataminer already opens.
