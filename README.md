@@ -55,8 +55,8 @@ Hard links rather than copies, since these are multi-GB files on the same volume
 `export_json`. The dataminer wipes its output directory on every run, which is why enrichment has
 to come after and cannot be cached.
 
-**enrich** — thirteen PowerShell steps for things the Rust does not emit: learned techniques,
-synergy members and list order, aura types, passive icons and builds, gender, name parts,
+**enrich** — fourteen PowerShell steps for things the Rust does not emit: learned techniques,
+synergy members and list order, shop prices, aura types, passive icons and builds, gender, names,
 nicknames, spirit drops and where to find them, position and style legends. Order matters —
 `spirit_pool` writes the list `add_drop_flag` reads, and `add_legend_tail` builds furigana-free
 variants of fields earlier steps create. It ends by counting unresolved `<...>` placeholders and
@@ -108,8 +108,15 @@ no guessing at all:
 | --- | --- | --- |
 | `icon_tactics` | `icon_wht10020` | `tactics[].string_id` — 71/71 |
 | `icon_synergy` | `sf01001`, `sp09003` | `synergies[].string_id` — all 35 the game lists |
+| `icon_item10` | `tk_hr000001`, `tk_si000004` | `currencies[].string_id` — the shop currencies |
 | `icon_teambuff` | `icon_teambuff19`, `icon_teambuff_tgt04` | numbered artwork slots, see below |
 | `icon_common` | `icon_build_l02`, `icon_gender01`, `icon_type03` | numbered artwork slots |
+
+The same header serves a second layout. `icon_item10` is not an atlas but **51 separate 256×256
+textures in fixed-size blocks**, one per name, with no rectangle table and one DDS each.
+`cut-rects.ps1` handles both, and tells them apart by the number of `DDS ` magics — not by
+whether the bytes at `0x94` look like a rectangle, because in `icon_item10` they do and they are
+not one.
 
 That closes two things that had been open for a long time. The tactic icons had been recovered by
 hand and locked in by pixel-matching; the file agrees with all 70 of them and names the 71st, the
@@ -188,6 +195,24 @@ in French, `ad_a` and `il_l'` in Italian.
 
 Roma names resolve against roma parts, not localised ones — `<FUL:UMIBOZU>` in `name_original` is
 Umibozu, not Kraken.
+
+### Shop prices
+
+`gamedata/shop/shop_config` holds sixteen shops. A shop points at a `SHOP_TOKEN_GROUP` — an
+ordered list of the currencies it accepts — and each `SHOP_INFO_ITEM` carries one amount per
+currency in that order, starting at column 7. A price is read by zipping the item's columns onto
+its shop's token list. The currencies are the `tk_*` entries of `ITEM_CONSUME_INFO`, 36 of them,
+with names like *Passion*, *Gratitude*, *Grandpa's notebook page*.
+
+Two of the sixteen work differently: `market_05` and `market_06` are trade counters with no token
+group and `SHOP_INFO_ITEM_CONSUME` sub rows instead. Every one of those 433 ids is a `chara_param`
+row — **you pay in spirits, not currency** — so they resolve through the same
+`chara_param → chara_base` join the learned-move step uses. Nineteen of the resulting lines ask
+for an NPC, which has no id in the bundles, and come out `null`.
+
+Coverage: hissatsu 751/852, equipment 458/468, synergies 35/37 (the listed ones), auras 178/443,
+aura hissatsu 19/152. **Nothing sells tactics or passives** — which fits, since passives are
+rolled rather than bought.
 
 ### Which icon a passive gets
 

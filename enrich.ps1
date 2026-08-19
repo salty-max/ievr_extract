@@ -47,6 +47,7 @@ $steps = @(
     @('add_skills.ps1',       'techniques apprises et niveau'),
     @('add_members.ps1',      'membres de chaque synergie'),
     @('add_synergy_order.ps1','ordre d''affichage des synergies'),
+    @('add_shop_prices.ps1',  'prix en boutique et monnaies'),
     @('add_aura_type.ps1',    'keshin, armed, mixi max, totem...'),
     @('add_passive_icons.ps1','icone et build de chaque passif'),
     @('add_gender.ps1',       'genre'),
