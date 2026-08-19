@@ -59,7 +59,13 @@ $buildNames = @('breach', 'counter', 'bond', 'tension', 'rough_play', 'justice')
 # The config nests each effect's sub lists as separate tables, so the rows have to be walked in
 # file order: a BUFF_ICON_DATA row belongs to the last PASSIVE_SKILL_EFFECT_INFO row seen.
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) 'ievr_passive_effects.json'
-$null = & $dumpSchema $effectConfig.FullName $tmp 2>&1   # it lists every nested table on the way
+# dump_schema lists every nested table it walks past, on stderr. Under $ErrorActionPreference
+# Stop, PowerShell 5.1 turns each of those lines into a terminating error, so quiet it here only.
+try {
+    $ErrorActionPreference = 'Continue'
+    & $dumpSchema $effectConfig.FullName $tmp *> $null
+} finally { $ErrorActionPreference = 'Stop' }
+if (-not (Test-Path $tmp)) { throw "dump_schema n'a rien ecrit pour $($effectConfig.Name)" }
 $doc = Get-Content $tmp -Raw | ConvertFrom-Json
 Remove-Item $tmp -Force
 

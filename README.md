@@ -55,11 +55,12 @@ Hard links rather than copies, since these are multi-GB files on the same volume
 `export_json`. The dataminer wipes its output directory on every run, which is why enrichment has
 to come after and cannot be cached.
 
-**enrich** — twelve PowerShell steps for things the Rust does not emit: learned techniques,
-synergy members, aura types, passive icons and builds, gender, name parts, nicknames, spirit
-drops and where to find them, position and style legends. Order matters — `spirit_pool` writes the list `add_drop_flag` reads,
-and `add_legend_tail` builds furigana-free variants of fields earlier steps create. It ends by
-counting unresolved `<...>` placeholders and refuses to finish if it finds any.
+**enrich** — thirteen PowerShell steps for things the Rust does not emit: learned techniques,
+synergy members and list order, aura types, passive icons and builds, gender, name parts,
+nicknames, spirit drops and where to find them, position and style legends. Order matters —
+`spirit_pool` writes the list `add_drop_flag` reads, and `add_legend_tail` builds furigana-free
+variants of fields earlier steps create. It ends by counting unresolved `<...>` placeholders and
+refuses to finish if it finds any.
 
 **verify** — copies the bundles to `out/` and checks each section is non-empty.
 
@@ -106,14 +107,15 @@ no guessing at all:
 | Atlas | Sprite names | Joins to |
 | --- | --- | --- |
 | `icon_tactics` | `icon_wht10020` | `tactics[].string_id` — 71/71 |
-| `icon_synergy` | `sf01001`, `sp09003` | `synergies[].string_id` — 35/37 |
+| `icon_synergy` | `sf01001`, `sp09003` | `synergies[].string_id` — all 35 the game lists |
 | `icon_teambuff` | `icon_teambuff19`, `icon_teambuff_tgt04` | numbered artwork slots, see below |
 | `icon_common` | `icon_build_l02`, `icon_gender01`, `icon_type03` | numbered artwork slots |
 
 That closes two things that had been open for a long time. The tactic icons had been recovered by
 hand and locked in by pixel-matching; the file agrees with all 70 of them and names the 71st, the
 one the manual pass had written off as unused (`wht20140`). The synergy icons, which no config
-column predicted, simply carry their synergy's id.
+column predicted, simply carry their synergy's id — and the two synergies left without one turn
+out to be the two the game does not list, so the set is complete.
 
 For UI atlases the name is a numbered slot instead, and **the number is not the enum the data
 uses** — `icon_build_l00…l05` happens to line up with `legend.style`, `icon_type01…04` does not
@@ -225,8 +227,11 @@ rest are graded in `_passive_icons.csv` next to the cut sprites.
   candidate pool for a style and growth pattern.
 - **Passive icon ids do not resolve to sprites** — see above. Seventeen of the 25 are still
   graded guesses.
-- **Two synergies have no icon**, `sf01000010` and `sf01000020`. The other 35 are named by the
-  atlas; nothing in `icon_synergy` answers to those two ids.
+- **Two synergies have no icon** — and that is correct, not a gap. `sf01000010` and `sf01000020`
+  are not in the game's synergy list: `item_config` column 4 holds a slot number, 7601–7635, for
+  the 35 that are shown and 0 for these two. They are leftovers from the launch id scheme, the
+  long form the first characters use (`c01000010`), and no sprite answers to their name in any
+  of the 43 icon atlases. The bundles carry `listed` so a list can filter them out.
 - **The enrichment is still PowerShell shelling out to `show_table` and parsing its output.** It
   works and it is checked, but it belongs in Rust. Mechanical to move: every config those steps
   read is one the dataminer already opens.
