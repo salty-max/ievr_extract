@@ -78,33 +78,52 @@ rarely and cutting them is a judgement call.
   one. Each `.cpk` starts with its own table of contents, XOR-encrypted with a key that is the
   CRC32 of the archive's own file name; decrypt the first few MB of each and the names fall out
   as plain text. This is the trick behind unpacking 200 MB instead of 56.7 GB.
-- **`cut-rects.ps1`** — cuts an atlas using the sprite table inside its own header. Use this one.
+- **`cut-rects.ps1`** — cuts an atlas using the sprite and name tables inside its own header, and
+  writes each sprite under the name the game calls it. Use this one.
 - **`slice-grid.ps1`** — the older fallback: cuts by detecting transparent gutters, for an atlas
   whose header table does not parse.
 - **`contact-sheet.ps1`** — renders an atlas with numbered cells, for reading it.
 - **`cri_lib.ps1`** — the CRI block cipher and CRC32, shared by the above.
 
-Three things worth not rediscovering:
+### Atlases label themselves
 
-**A `.g4tx` carries its own sprite table.** No `.g4tp` descriptor ships, which made the atlases
-look like undocumented grids for a long time — but the header does the job. It is a list of
-sub-rectangles, `x y w h` as `u16`, 24 bytes per record, from `0x94` up to the `DDS ` magic.
-That is authoritative, and it catches what a grid pass cannot: `icon_teambuff` packs eight 48×32
-position badges (`MF` `DF` `GK` … `FW`) into what looks like a single 128×128 cell, and a grid
-slicer silently merges them into three garbled cells.
+**Every `.g4tx` names its own sprites.** This is the thing to know; nothing else here matters as
+much. The header is:
 
-**Sprite order is the packer's insertion order, not row-major.** The rects come out in expanding
-L-shells — (0,0), (1,0), (0,1), (1,1), (2,0), (2,1), (0,2)… — because the sheet grew as sprites
-were added. So neither the grid index nor the sprite index is anything you can guess from the
-picture.
+```
+0x94    sub-rectangles, x y w h as u16, 24 bytes per record, ending at a zero u32
+then    one CRC32 per name — the atlas's own name first, then one per rectangle
+then    a u16 offset table, then the names as NUL terminated ASCII
+```
 
-**Neither index is the id the data uses.** Verified on tactics, where the mapping is known for all
-71 icons: the sprite order tracks ascending `wht*` id for the original set but appends
-later-patched tactics at the end, so it is *correlated* with the data and equal to it nowhere.
-All 17 columns of `SPECIAL_TACTICS_INFO` were tested against the cells, best 3/81. The
-data→sprite step lives in the menu code, which ships as compiled Lua. Labelling an atlas still
-means matching it against names obtained elsewhere — an in-game screenshot, or, as for the
-passives below, the text of the entries that use each icon.
+The rect table and the hash table run in parallel, so a sprite's picture and its name are joined
+by position — and the join checks itself, because the stored hash has to be the CRC32 of the
+name it points at. `cut-rects.ps1` refuses to name a sprite whose hash does not come back.
+
+For content atlases **the name is the game's own string id**, so the atlas is fully labelled with
+no guessing at all:
+
+| Atlas | Sprite names | Joins to |
+| --- | --- | --- |
+| `icon_tactics` | `icon_wht10020` | `tactics[].string_id` — 71/71 |
+| `icon_synergy` | `sf01001`, `sp09003` | `synergies[].string_id` — 35/37 |
+| `icon_teambuff` | `icon_teambuff19`, `icon_teambuff_tgt04` | numbered artwork slots, see below |
+| `icon_common` | `icon_build_l02`, `icon_gender01`, `icon_type03` | numbered artwork slots |
+
+That closes two things that had been open for a long time. The tactic icons had been recovered by
+hand and locked in by pixel-matching; the file agrees with all 70 of them and names the 71st, the
+one the manual pass had written off as unused (`wht20140`). The synergy icons, which no config
+column predicted, simply carry their synergy's id.
+
+For UI atlases the name is a numbered slot instead, and **the number is not the enum the data
+uses** — `icon_build_l00…l05` happens to line up with `legend.style`, `icon_type01…04` does not
+line up with `legend.element`, and `icon_teambuff01…38` does not line up with the passive icon
+ids. That last hop lives in the menu code, which ships as compiled Lua.
+
+Two smaller notes. Cutting by rectangles catches sprites smaller than a grid cell — `icon_teambuff`
+packs eight 48×32 position badges (`MF` `DF` `GK` … `FW`) into what looks like one 128×128 cell,
+and a grid pass merges them into three garbled cells. And sprite order is the packer's insertion
+order, expanding L-shells rather than row-major, so it is not something to read anything into.
 
 ## After a game patch
 
@@ -186,11 +205,16 @@ already uses, confirmed by the passives that name their own build ("For each Cha
 Bond Team Build…" → 2).
 
 What is still missing is only the last hop, id → sprite. The atlas is
-`menu/200_icon/08_icon_teambuff/<LG>/icon_teambuff.g4tx` (localised, 45 pictograms plus the 8
-position badges), and the ids are not its sprite indices. Eight are certain anyway because the
-pictogram is unambiguous or is literally the text — `AT`, `DF`, `T`, the intact and the breached
-castle wall, the two money bags, the shooting comet. The rest are graded in
-`_passive_icons.csv` next to the cut sprites.
+`menu/200_icon/08_icon_teambuff/<LG>/icon_teambuff.g4tx`, whose sprites are named
+`icon_teambuff01` … `icon_teambuff38` — 38 names for the 38 possible ids, which looks like the
+answer and is not: id 2 is "Shot AT" and `icon_teambuff02` is the shooting comet, but id 0 is
+"AT" and `icon_teambuff01` is a boot striking a ball while the `AT` lettering is
+`icon_teambuff19`. No offset fits, the extraction contains no table holding the values in either
+direction, and `nie.exe` ships packed with no plaintext strings at all.
+
+Eight ids are certain anyway because the pictogram is unambiguous or is literally the text — `AT`,
+`DF`, `T`, the intact and the breached castle wall, the two money bags, the shooting comet. The
+rest are graded in `_passive_icons.csv` next to the cut sprites.
 
 ## Known limits
 
@@ -199,9 +223,10 @@ castle wall, the two money bags, the shooting comet. The rest are graded in
   attributes, not identity: 161 distinct passives out of 1716 across every pool. Each player ships
   five that scale with rarity plus a custom slot at level 50. The most a tool can offer is the
   candidate pool for a style and growth pattern.
-- **Synergy icons are unlabelled** — 41 icons, 37 synergies, no link in any data file.
 - **Passive icon ids do not resolve to sprites** — see above. Seventeen of the 25 are still
   graded guesses.
+- **Two synergies have no icon**, `sf01000010` and `sf01000020`. The other 35 are named by the
+  atlas; nothing in `icon_synergy` answers to those two ids.
 - **The enrichment is still PowerShell shelling out to `show_table` and parsing its output.** It
   works and it is checked, but it belongs in Rust. Mechanical to move: every config those steps
   read is one the dataminer already opens.
