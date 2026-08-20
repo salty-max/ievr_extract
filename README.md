@@ -209,9 +209,18 @@ That closes the other half of the passive story. The innate five are rolled from
 `ability_learning_config` and cannot be pinned to a character; the custom sixth is farmed, and
 this is the list of what is farmable.
 
-**Which opponent uses which pool is not in the data.** The 132 pool ids appear in exactly one
-file in the extraction — their own — checked as raw `u32` across all 5863 configs, and no string
-anywhere in gamedata hashes to any of them. That selector is in `nie.exe`, which ships packed.
+A pool is one opponent, and the pools are strongly themed — one is all Castle Wall DF, the next
+all Shot AT — so each is tagged with the `icon_label` its five members mostly share: 44 of the 129
+`focus_at_df`, 36 `shot_at`, 22 `castle_wall_df`.
+
+**Which opponent, though, is not in the data**, and that was established rather than assumed. The
+132 pool ids are in no other file as a raw `u32` (all 5863 configs); in none of the 32 619 base64
+condition blobs once decoded — worth knowing on its own, since those blobs are stored as *literal
+base64 text*, so a byte scan of the file cannot see what is inside them; and nothing hashes to
+them, having tried the 429 000 strings in the extraction, the 56 000 archive file names, team
+names in every language, and the 765 team string ids under every prefix, suffix, case and
+encoding. `CRC32(string_id)` is verifiably the convention for team ids, so the pool names simply
+do not ship. The selector is in `nie.exe`, which is packed — no plaintext strings at all.
 
 ### Shop prices
 

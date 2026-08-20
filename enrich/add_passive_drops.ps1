@@ -12,9 +12,16 @@ $ErrorActionPreference = "Stop"
 # five passives each, weight 1, no rarity gate - and that is what a real opponent offers.
 # The rule below is that shape, not a row count, so it survives a patch adding pools.
 #
-# What is NOT here is which opponent uses which pool. The 132 pool ids appear in exactly one
-# file in the extraction, their own - checked as raw u32 across all 5863 configs - and no string
-# anywhere in gamedata hashes to any of them. That selector lives in the executable.
+# What is NOT here is which opponent uses which pool, and that was searched properly: the 132
+# ids are in no other file as a raw u32 (all 5863 configs), in none of the 32619 base64 condition
+# blobs once decoded, and no string hashes to them - not the 429k strings in the extraction, not
+# the 56k archive file names, not the team names in any language, not the 765 team string ids
+# under any prefix, suffix, case or encoding. Team ids *are* CRC32 of their string id, verified,
+# so the pool names simply do not ship. That selector lives in the executable.
+#
+# The pools are strongly themed, though, and that is the usable proxy: one is all Castle Wall DF,
+# another all Shot AT. Each pool therefore carries the icon_label its members mostly share, which
+# is as close to "which opponent" as the data gets.
 
 $showTable = "$env:IEVR_BIN\show_table.exe"
 $gamedata  = "$env:IEVR_EXTRACT\data\common\gamedata"
@@ -64,6 +71,9 @@ foreach ($lang in @('en', 'fr', 'ja')) {
     $path = "$jsonDir\ievr.$lang.json"
     $bundle = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
 
+    $label = @{}
+    foreach ($p in $bundle.passives) { $label[[string]$p.id] = $p.icon_label }
+
     $marked = 0
     foreach ($p in $bundle.passives) {
         $n = $poolCount[[string]$p.id]
@@ -71,8 +81,16 @@ foreach ($lang in @('en', 'fr', 'ja')) {
         $p | Add-Member -NotePropertyName droppable  -NotePropertyValue ([bool]$n) -Force
         $p | Add-Member -NotePropertyName drop_pools -NotePropertyValue $(if ($n) { $n } else { $null }) -Force
     }
-    # the comma keeps each pool an array of its own; without it PowerShell flattens all 129
-    $bundle | Add-Member -NotePropertyName passive_drop_pools -NotePropertyValue @($real | ForEach-Object { , @($_.members) }) -Force
+
+    $out = foreach ($pool in $real) {
+        $themes = @($pool.members | ForEach-Object { $label[[string]$_] } | Where-Object { $_ }) |
+            Group-Object | Sort-Object Count -Descending
+        [pscustomobject]@{
+            theme    = if ($themes) { $themes[0].Name } else { $null }
+            passives = @($pool.members)
+        }
+    }
+    $bundle | Add-Member -NotePropertyName passive_drop_pools -NotePropertyValue @($out) -Force
 
     $bundle | ConvertTo-Json -Depth 12 -Compress | Set-Content $path -Encoding UTF8 -NoNewline
     Write-Output ("{0} : {1} passifs marques droppables sur {2}" -f $lang, $marked, $bundle.passives.Count)
