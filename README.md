@@ -55,9 +55,9 @@ Hard links rather than copies, since these are multi-GB files on the same volume
 `export_json`. The dataminer wipes its output directory on every run, which is why enrichment has
 to come after and cannot be cached.
 
-**enrich** — fourteen PowerShell steps for things the Rust does not emit: learned techniques,
-synergy members and list order, shop prices, aura types, passive icons and builds, gender, names,
-nicknames, spirit drops and where to find them, position and style legends. Order matters —
+**enrich** — fifteen PowerShell steps for things the Rust does not emit: learned techniques,
+synergy members and list order, shop prices, aura types, passive icons, builds and drops, gender,
+names, nicknames, spirit drops and where to find them, position and style legends. Order matters —
 `spirit_pool` writes the list `add_drop_flag` reads, and `add_legend_tail` builds furigana-free
 variants of fields earlier steps create. It ends by counting unresolved `<...>` placeholders and
 refuses to finish if it finds any.
@@ -196,6 +196,23 @@ in French, `ad_a` and `il_l'` in Italian.
 Roma names resolve against roma parts, not localised ones — `<FUL:UMIBOZU>` in `name_original` is
 Umibozu, not Kraken.
 
+### Which passives drop from a match
+
+`character/team_passive_lot_table_config` holds the pools. 132 of them, 653 rows of
+`(passive, lotWeight, condition, rarityEnableFlag[6])`, 114 distinct passives — **all base ids,
+never the `_NN` rarity variants**, which fits: the match drops the passive and its tier follows
+the match's rarity. Three pools are samples, and they give themselves away by being the only ones
+with real weights and rarity gates; the 129 that remain are flat, five passives each at weight 1,
+covering 109 of the 1716.
+
+That closes the other half of the passive story. The innate five are rolled from
+`ability_learning_config` and cannot be pinned to a character; the custom sixth is farmed, and
+this is the list of what is farmable.
+
+**Which opponent uses which pool is not in the data.** The 132 pool ids appear in exactly one
+file in the extraction — their own — checked as raw `u32` across all 5863 configs, and no string
+anywhere in gamedata hashes to any of them. That selector is in `nie.exe`, which ships packed.
+
 ### Shop prices
 
 `gamedata/shop/shop_config` holds sixteen shops. A shop points at a `SHOP_TOKEN_GROUP` — an
@@ -211,8 +228,8 @@ row — **you pay in spirits, not currency** — so they resolve through the sam
 for an NPC, which has no id in the bundles, and come out `null`.
 
 Coverage: hissatsu 751/852, equipment 458/468, synergies 35/37 (the listed ones), auras 178/443,
-aura hissatsu 19/152. **Nothing sells tactics or passives** — which fits, since passives are
-rolled rather than bought.
+aura hissatsu 19/152. **Nothing sells tactics or passives** — which fits: passives are rolled or
+dropped, never bought. See the section above for where they do come from.
 
 ### Which icon a passive gets
 

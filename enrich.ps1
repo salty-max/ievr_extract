@@ -50,6 +50,7 @@ $steps = @(
     @('add_shop_prices.ps1',  'prix en boutique et monnaies'),
     @('add_aura_type.ps1',    'keshin, armed, mixi max, totem...'),
     @('add_passive_icons.ps1','icone et build de chaque passif'),
+    @('add_passive_drops.ps1','passifs qui tombent en match'),
     @('add_gender.ps1',       'genre'),
     @('add_names.ps1',        'nom de famille et prenom'),
     @('add_nickname.ps1',     'nom court affiche sur le terrain'),
